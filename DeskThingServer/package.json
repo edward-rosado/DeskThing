@@ -152,7 +152,8 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
         "NSAppleEventsUsageDescription": "This app requires access to send Apple Events to communicate with other applications.",
-        "NSMicrophoneUsageDescription": "This app requires microphone access to record audio."
+        "NSMicrophoneUsageDescription": "This app requires microphone access to record audio.",
+        "NSBluetoothAlwaysUsageDescription": "DeskThing connects to your Car Thing over Bluetooth so it can run without a data cable."
       },
       "notarize": false,
       "category": "public.app-category.developer-tools",
@@ -160,6 +161,14 @@
         {
           "from": "adb_source/mac",
           "to": "resources/mac"
+        },
+        {
+          "from": "bt_source/mac",
+          "to": "resources/mac"
+        },
+        {
+          "from": "bt_source/superbird",
+          "to": "resources/superbird"
         }
       ]
     },
