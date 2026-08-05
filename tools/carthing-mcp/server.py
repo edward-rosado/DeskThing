@@ -136,6 +136,12 @@ def tool_eval(args):
         msg_id = cdp.send('Runtime.evaluate', {
             'expression': expression, 'returnByValue': True, 'awaitPromise': True})
         result = cdp.await_result(msg_id)
+        # A thrown exception arrives as a *successful* CDP response carrying
+        # exceptionDetails. Reporting only the (undefined) value would say
+        # "null" and hide the error — the tool would lie about what happened.
+        if 'exceptionDetails' in result:
+            raise ToolError('JavaScript exception: %s'
+                            % ENGINE.describe_exception(result['exceptionDetails']))
         value = result.get('result', {})
         if value.get('type') == 'undefined':
             text = 'undefined'
