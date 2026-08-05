@@ -123,5 +123,9 @@ on the Bluetooth setup page.
 
 ---
 
-*Developer/architecture notes (frame protocol, control API, adding a platform)
-live in [`DeskThingServer/bt_source/README.md`](../DeskThingServer/bt_source/README.md).*
+---
+
+*Developer notes: the frame protocol, control API, and how to add a platform are
+in [`DeskThingServer/bt_source/README.md`](../DeskThingServer/bt_source/README.md).
+For screenshotting and debugging the device over the Bluetooth link, see
+[`device-debugging.md`](device-debugging.md).*
