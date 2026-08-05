@@ -20,7 +20,7 @@ mux simply becomes that endpoint, so the client needs no changes.
 
 | Path | Runs on | Role |
 | --- | --- | --- |
-| `btbridge.swift` | Computer (macOS) | Opens RFCOMM to the device, demuxes streams onto the local server port, serves the control API. Compiled by `scripts/build-btbridge.js` into `mac/btbridge` (gitignored) during the build; packaged into `Contents/Resources/mac/`. |
+| `btbridge.swift` | Computer (macOS) | Opens RFCOMM to the device, demuxes streams onto the local server port, serves the control API. Compiled by `bt_source/build-btbridge.js` into `mac/btbridge` (gitignored) during the build; packaged into `Contents/Resources/mac/`. |
 | `superbird/btmux.py` | Car Thing | Owns `127.0.0.1:8891` on the device, muxes client TCP streams into frames over the RFCOMM channel. Installed by the in-app provisioner as a supervisord service. |
 
 ## Frame protocol
@@ -62,7 +62,7 @@ The transport is macOS-only today, but the seam is small:
    helper, report status, provision devices).
 2. Ship a helper binary under `bt_source/<platform>/` that speaks the frame
    protocol above and serves the same control API, and teach
-   `scripts/build-btbridge.js` and the packaging config to build and bundle it.
+   `bt_source/build-btbridge.js` and the packaging config to build and bundle it.
 
 Platforms without a helper report `supported: false` and the UI hides itself —
 plain USB setups look no different than before.
