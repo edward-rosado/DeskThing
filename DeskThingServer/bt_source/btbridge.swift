@@ -25,6 +25,32 @@ import Network
 let rfcommChannelID: UInt8 = 3
 let targetHost = NWEndpoint.Host("127.0.0.1")
 let targetPort = NWEndpoint.Port(rawValue: 8891)!
+
+// MARK: - Protocol v2
+//
+// v1 was one-directional: only the device opened streams, always to the
+// DeskThing server. v2 lets either side open, and an OPEN carries a target.
+// The stream-ID space is split by its high bit so both ends can allocate
+// without coordinating: the device keeps the low half, we take the high half.
+let protocolVersion: UInt8 = 2
+let nsMask: UInt32 = 0x8000_0000
+let capInbound: UInt16 = 1 << 0
+let capTargeted: UInt16 = 1 << 1
+let ourCaps: UInt16 = capInbound | capTargeted
+
+let kindService: UInt8 = 0x01
+
+enum AckCode: UInt8 {
+  case ok = 0, refused = 1, unreachable = 2, unknownService = 3, badNamespace = 4
+}
+
+/// Services on the DEVICE that this computer may open, exposed to the UI as
+/// friendly names. The device enforces the same list independently — this copy
+/// exists so we can refuse early and tell the user what is available.
+let deviceServices: [String: String] = [
+  "cdp": "Chromium remote debugging",
+  "pairing": "Pairing agent status"
+]
 let controlPort = NWEndpoint.Port(rawValue: 8899)!
 
 let prefURL = FileManager.default
@@ -102,6 +128,7 @@ final class State {
   private var _pairingCode: String? = nil
   private var _pairingError: String? = nil
   private var _found: [FoundDevice] = []
+  private weak var _bridge: Bridge?
 
   var preference: Preference {
     get { q.sync { _preference } }
@@ -130,6 +157,11 @@ final class State {
   var found: [FoundDevice] {
     get { q.sync { _found } }
     set { q.sync { _found = newValue } }
+  }
+  /// The live tunnel, when one is up. Service forwarding needs to reach it.
+  var bridge: Bridge? {
+    get { q.sync { _bridge } }
+    set { q.sync { _bridge = newValue } }
   }
 
   /// The transport actually carrying data right now. Falling back to USB only
@@ -395,6 +427,86 @@ enum Unpairer {
   }
 }
 
+// MARK: - Device service forwarding
+//
+// Exposes a named service on the DEVICE as a plain TCP port on this computer,
+// so ordinary tools work unmodified — point chrome://inspect at the forwarded
+// port and you are debugging the Car Thing over Bluetooth, no cable.
+
+final class ServiceForwarder {
+  static let shared = ServiceForwarder()
+  private var listeners: [String: NWListener] = [:]
+  private var ports: [String: UInt16] = [:]
+  private let q = DispatchQueue(label: "bridge.forward")
+
+  /// Currently forwarded services, as name -> local port.
+  var active: [String: UInt16] { q.sync { ports } }
+
+  /// Start (or return an existing) local listener for a device service.
+  func open(_ name: String) -> (port: UInt16, error: String?) {
+    return q.sync {
+      if let existing = ports[name] { return (existing, nil) }
+      guard deviceServices[name] != nil else { return (0, "unknown service") }
+      guard let bridge = State.shared.bridge, bridge.supportsInbound() else {
+        return (0, "device does not support inbound streams")
+      }
+      let params = NWParameters.tcp
+      params.allowLocalEndpointReuse = true
+      // Loopback only: this is a doorway into the device and must not be
+      // reachable from the network.
+      params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+      guard let l = try? NWListener(using: params) else {
+        return (0, "could not bind a local port")
+      }
+      l.newConnectionHandler = { conn in
+        guard let bridge = State.shared.bridge else { conn.cancel(); return }
+        bridge.enqueueOpen(name, local: conn)
+      }
+      l.stateUpdateHandler = { [weak self] state in
+        if case .ready = state, let p = l.port?.rawValue {
+          self?.q.async {
+            self?.ports[name] = p
+            log("forward: device '\(name)' available on 127.0.0.1:\(p)")
+          }
+        }
+      }
+      l.start(queue: q)
+      listeners[name] = l
+      // The port is assigned asynchronously; wait briefly so the caller can be
+      // told which port to use.
+      for _ in 0..<50 {
+        if let p = l.port?.rawValue, p != 0 {
+          ports[name] = p
+          return (p, nil)
+        }
+        usleep(20_000)
+      }
+      return (0, "listener did not come up")
+    }
+  }
+
+  func close(_ name: String) {
+    q.sync {
+      listeners.removeValue(forKey: name)?.cancel()
+      ports.removeValue(forKey: name)
+      log("forward: stopped '\(name)'")
+    }
+  }
+
+  /// Drop every forward — called when the radio link goes away, since the
+  /// streams behind these listeners no longer exist.
+  func closeAll() {
+    q.sync {
+      for (name, l) in listeners {
+        l.cancel()
+        log("forward: stopped '\(name)' (link down)")
+      }
+      listeners.removeAll()
+      ports.removeAll()
+    }
+  }
+}
+
 // MARK: - Control API (consumed by the DeskThing server)
 
 final class ControlServer {
@@ -486,6 +598,21 @@ final class ControlServer {
         s.save()
         log("device address set to \(s.deviceAddress ?? "?") by UI")
       }
+    } else if request.hasPrefix("POST /forward/open") {
+      // Expose a device service as a local TCP port.
+      if let obj = jsonBody(request), let name = obj["service"] as? String {
+        let (port, err) = ServiceForwarder.shared.open(name)
+        if let err = err {
+          return "{\"ok\":false,\"error\":\"\(err)\"}"
+        }
+        return "{\"ok\":true,\"service\":\"\(name)\",\"port\":\(port)}"
+      }
+      return "{\"ok\":false,\"error\":\"missing service\"}"
+    } else if request.hasPrefix("POST /forward/close") {
+      if let obj = jsonBody(request), let name = obj["service"] as? String {
+        ServiceForwarder.shared.close(name)
+      }
+      return "{\"ok\":true}"
     }
 
     let foundJSON = s.found
@@ -495,11 +622,25 @@ final class ControlServer {
     let err = s.pairingError.map { "\"\($0.replacingOccurrences(of: "\"", with: ""))\"" } ?? "null"
     let dev = s.deviceAddress.map { "\"\($0)\"" } ?? "null"
 
+    // Protocol + forwarding state, so the UI can show what the device supports
+    // and which services are currently reachable from this computer.
+    let bridge = s.bridge
+    let inbound = bridge?.supportsInbound() ?? false
+    let available = inbound ? deviceServices.keys.sorted() : []
+    let servicesJSON = available
+      .map { "{\"name\":\"\($0)\",\"label\":\"\(deviceServices[$0] ?? $0)\"}" }
+      .joined(separator: ",")
+    let forwardsJSON = ServiceForwarder.shared.active
+      .map { "{\"service\":\"\($0.key)\",\"port\":\($0.value)}" }
+      .joined(separator: ",")
+
     return """
     {"preference":"\(s.preference.rawValue)","transport":"\(s.activeTransport)","linkUp":\(s.linkUp),\
     "deviceAddress":\(dev),"paired":\(s.paired),\
     "pairing":{"stage":"\(s.pairingStage.rawValue)","code":\(code),"error":\(err)},\
-    "found":[\(foundJSON)]}
+    "found":[\(foundJSON)],\
+    "protocol":{"version":\(protocolVersion),"inbound":\(inbound)},\
+    "services":[\(servicesJSON)],"forwards":[\(forwardsJSON)]}
     """
   }
 }
@@ -523,6 +664,9 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
   private var opened = false
   private var lastPong = Date()
   private var heartbeatTimer: DispatchSourceTimer?
+  private var peerVersion: UInt8 = 1   // assume v1 until a HELLO says otherwise
+  private var peerCaps: UInt16 = 0
+  private var computerSidCounter: UInt32 = 0
 
   func rfcommChannelOpenComplete(_ ch: IOBluetoothRFCOMMChannel, status error: IOReturn) {
     if error != kIOReturnSuccess {
@@ -537,6 +681,8 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     State.shared.linkUp = true
     preferBluetooth()
     startHeartbeat()
+    // A v1 device ignores the unknown frame type and keeps working.
+    sendHello()
   }
 
   func isOpened() -> Bool { q.sync { opened } }
@@ -573,6 +719,10 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
   func rfcommChannelClosed(_ ch: IOBluetoothRFCOMMChannel) {
     log("rfcomm closed")
     stopHeartbeat()
+    // The streams behind any forwarded ports are gone with the link; drop the
+    // listeners so nothing accepts a connection it cannot serve.
+    ServiceForwarder.shared.closeAll()
+    State.shared.bridge = nil
     State.shared.linkUp = false
     fallBackToUSB()
     q.sync {
@@ -607,15 +757,96 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         conns.removeValue(forKey: sid)
       case 4: sendFrame(5, 0, Data())  // PING -> PONG
       case 5: lastPong = Date()        // PONG from device
+      case 6: applyHello(payload)      // HELLO
+      case 7:                          // OPEN_ACK for a stream we opened
+        let code = payload.first ?? AckCode.ok.rawValue
+        if code != AckCode.ok.rawValue {
+          log("device refused stream \(sid) (code \(code))")
+          conns[sid]?.cancel()
+          conns.removeValue(forKey: sid)
+        }
       default:
-        log("bad frame type \(t), resetting buffer")
-        rxBuf.removeAll()
+        // A frame from a newer peer. Skip it — its bytes are already consumed
+        // above. Wiping the buffer here would discard the in-flight bytes of
+        // every other stream and desync the link.
+        log("skipping unknown frame type \(t)")
       }
     }
   }
 
+  // MARK: - Protocol v2
+
+  /// Announce our version and capabilities, and hand the device our clock —
+  /// it has no RTC, and a wrong clock breaks every TLS handshake it ever makes
+  /// in ways that look like a tunnel bug.
+  func sendHello() {
+    var payload = Data([protocolVersion])
+    var caps = ourCaps.bigEndian
+    withUnsafeBytes(of: &caps) { payload.append(contentsOf: $0) }
+    var epoch = UInt64(Date().timeIntervalSince1970).bigEndian
+    withUnsafeBytes(of: &epoch) { payload.append(contentsOf: $0) }
+    sendFrame(6, 0, payload)
+  }
+
+  private func applyHello(_ payload: Data) {
+    guard payload.count >= 11 else { return }
+    let bytes = [UInt8](payload)
+    let version = bytes[0]
+    let caps = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
+    q.sync {
+      peerVersion = version
+      peerCaps = caps
+    }
+    log("device speaks v\(version) caps=0x\(String(format: "%04x", caps))")
+  }
+
+  /// True once the device has told us it accepts computer-originated streams.
+  func supportsInbound() -> Bool {
+    q.sync { peerVersion >= 2 && (peerCaps & capInbound) != 0 }
+  }
+
+  /// Thread-safe entry point for the forwarder, which runs on its own queue.
+  func enqueueOpen(_ name: String, local: NWConnection) {
+    q.async { _ = self.openDeviceService(name, local: local) }
+  }
+
+  /// Open a stream to a named service ON THE DEVICE, bridging it to `local`.
+  /// Runs on q. Returns the stream id.
+  func openDeviceService(_ name: String, local: NWConnection) -> UInt32 {
+    let sid = nextComputerSid()
+    conns[sid] = local
+    var payload = Data([kindService, UInt8(name.utf8.count)])
+    payload.append(contentsOf: Array(name.utf8))
+    sendFrame(1, sid, payload)
+    local.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .failed, .cancelled:
+        self?.q.async {
+          if self?.conns.removeValue(forKey: sid) != nil {
+            self?.sendFrame(3, sid, Data())
+          }
+        }
+      case .ready:
+        self?.receiveLoop(sid, local)
+      default: break
+      }
+    }
+    local.start(queue: q)
+    return sid
+  }
+
+  /// Allocate in our half of the id space. Wraps inside the high half so it can
+  /// never stray into the device's.
+  private func nextComputerSid() -> UInt32 {
+    computerSidCounter &+= 1
+    if computerSidCounter == 0 { computerSidCounter = 1 }
+    return computerSidCounter | nsMask
+  }
+
   // Runs on q.
   private func openStream(_ sid: UInt32) {
+    // The device only ever opens streams to the DeskThing server, so its OPEN
+    // carries no descriptor and we keep v1 behavior here.
     let conn = NWConnection(host: targetHost, port: targetPort, using: .tcp)
     conns[sid] = conn
     conn.stateUpdateHandler = { [weak self] state in
@@ -755,10 +986,13 @@ func runBridgeLoop() -> Never {
 
     if bridge.isOpened() {
       log("connected")
+      State.shared.bridge = bridge
       while !bridge.isClosed() && State.shared.preference == .bluetooth {
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
       }
       log("session ended")
+      ServiceForwarder.shared.closeAll()
+      State.shared.bridge = nil
       channel?.close()
       device.closeConnection()
       State.shared.linkUp = false

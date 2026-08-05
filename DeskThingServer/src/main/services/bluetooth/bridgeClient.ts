@@ -1,7 +1,11 @@
 import {
+  BluetoothDeviceService,
+  BluetoothForward,
+  BluetoothForwardResult,
   BluetoothFoundDevice,
   BluetoothPairingState,
   BluetoothPreference,
+  BluetoothProtocolInfo,
   BluetoothTransport
 } from '@shared/types'
 
@@ -25,6 +29,9 @@ export interface BridgeControlState {
   paired: boolean
   pairing: BluetoothPairingState
   found: BluetoothFoundDevice[]
+  protocol?: BluetoothProtocolInfo
+  services?: BluetoothDeviceService[]
+  forwards?: BluetoothForward[]
 }
 
 const request = async (path: string, init?: RequestInit): Promise<BridgeControlState | null> => {
@@ -73,3 +80,27 @@ export const removeBridgePairing = (address: string): Promise<BridgeControlState
 /** Tells the helper which device to keep connecting to. */
 export const setBridgeDevice = (address: string): Promise<BridgeControlState | null> =>
   post('/device', { address })
+
+/**
+ * Exposes a named service on the device as a loopback TCP port here, so
+ * ordinary tools reach it unmodified. Returns the port, or an error the UI can
+ * show (e.g. the device predates protocol v2).
+ */
+export const openBridgeForward = async (service: string): Promise<BluetoothForwardResult> => {
+  try {
+    const res = await fetch(`${CONTROL_URL}/forward/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ service }),
+      signal: AbortSignal.timeout(TIMEOUT_MS)
+    })
+    if (!res.ok) return { ok: false, error: `helper returned ${res.status}` }
+    return (await res.json()) as BluetoothForwardResult
+  } catch {
+    return { ok: false, error: 'bridge helper is not reachable' }
+  }
+}
+
+/** Tears down a forwarded port. */
+export const closeBridgeForward = (service: string): Promise<BridgeControlState | null> =>
+  post('/forward/close', { service })

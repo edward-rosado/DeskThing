@@ -1,5 +1,6 @@
 import {
   BluetoothBridgeStatus,
+  BluetoothForwardResult,
   BluetoothPreference,
   BluetoothProvisionResult
 } from '@shared/types'
@@ -10,7 +11,9 @@ import {
   stopBridgeProcess
 } from './bridgeProcess'
 import {
+  closeBridgeForward,
   fetchBridgeState,
+  openBridgeForward,
   pushBridgePreference,
   removeBridgePairing,
   replyBridgePairing,
@@ -37,6 +40,12 @@ export interface BluetoothTransportManager {
   pair(address: string): Promise<BluetoothBridgeStatus>
   pairReply(accept: boolean): Promise<BluetoothBridgeStatus>
   unpair(address: string): Promise<BluetoothBridgeStatus>
+  /**
+   * Expose a named service on the device as a loopback port on this computer.
+   * Requires a device speaking protocol v2; older devices report unsupported.
+   */
+  openForward(service: string): Promise<BluetoothForwardResult>
+  closeForward(service: string): Promise<BluetoothBridgeStatus>
 }
 
 const IDLE_PAIRING = { stage: 'idle' as const, code: null, error: null }
@@ -70,7 +79,10 @@ const helperBridgeManager: BluetoothTransportManager = {
       deviceAddress: state?.deviceAddress ?? null,
       paired: state?.paired ?? false,
       pairing: state?.pairing ?? IDLE_PAIRING,
-      found: state?.found ?? []
+      found: state?.found ?? [],
+      protocol: state?.protocol,
+      services: state?.services ?? [],
+      forwards: state?.forwards ?? []
     }
   },
 
@@ -107,6 +119,13 @@ const helperBridgeManager: BluetoothTransportManager = {
   unpair: async (address): Promise<BluetoothBridgeStatus> => {
     await removeBridgePairing(address)
     return helperBridgeManager.getStatus()
+  },
+
+  openForward: (service): Promise<BluetoothForwardResult> => openBridgeForward(service),
+
+  closeForward: async (service): Promise<BluetoothBridgeStatus> => {
+    await closeBridgeForward(service)
+    return helperBridgeManager.getStatus()
   }
 }
 
@@ -130,7 +149,12 @@ const unsupportedManager: BluetoothTransportManager = {
   discover: async (): Promise<BluetoothBridgeStatus> => UNSUPPORTED_STATUS,
   pair: async (): Promise<BluetoothBridgeStatus> => UNSUPPORTED_STATUS,
   pairReply: async (): Promise<BluetoothBridgeStatus> => UNSUPPORTED_STATUS,
-  unpair: async (): Promise<BluetoothBridgeStatus> => UNSUPPORTED_STATUS
+  unpair: async (): Promise<BluetoothBridgeStatus> => UNSUPPORTED_STATUS,
+  openForward: async (): Promise<BluetoothForwardResult> => ({
+    ok: false,
+    error: 'No Bluetooth bridge is available for this operating system yet'
+  }),
+  closeForward: async (): Promise<BluetoothBridgeStatus> => UNSUPPORTED_STATUS
 }
 
 export const bluetoothManager: BluetoothTransportManager = bridgeBinaryExists()

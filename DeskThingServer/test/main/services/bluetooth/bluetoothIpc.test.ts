@@ -15,7 +15,9 @@ const managerMock = vi.hoisted(() => ({
   discover: vi.fn(),
   pair: vi.fn(),
   pairReply: vi.fn(),
-  unpair: vi.fn()
+  unpair: vi.fn(),
+  openForward: vi.fn(),
+  closeForward: vi.fn()
 }))
 
 vi.mock('@server/services/bluetooth', () => ({ bluetoothManager: managerMock }))
@@ -158,6 +160,18 @@ describe('bluetoothHandler', () => {
         type: IPC_BLUETOOTH_TYPES.UNPAIR,
         request: 'set',
         payload: { address: 'x' }
+      },
+      [IPC_BLUETOOTH_TYPES.OPEN_FORWARD]: {
+        kind: IPC_HANDLERS.BLUETOOTH,
+        type: IPC_BLUETOOTH_TYPES.OPEN_FORWARD,
+        request: 'set',
+        payload: { service: 'cdp' }
+      },
+      [IPC_BLUETOOTH_TYPES.CLOSE_FORWARD]: {
+        kind: IPC_HANDLERS.BLUETOOTH,
+        type: IPC_BLUETOOTH_TYPES.CLOSE_FORWARD,
+        request: 'set',
+        payload: { service: 'cdp' }
       }
     }
     for (const method of Object.values(managerMock)) {
