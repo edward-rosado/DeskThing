@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <bluetoothapis.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -329,6 +330,7 @@ typedef struct {
   unsigned ids[MAX_STREAMS];
   CRITICAL_SECTION wlock;
   volatile int dead;
+  volatile time_t last_pong;
 } Tunnel;
 
 static Tunnel *g_tun = NULL;
@@ -401,6 +403,26 @@ static void tunnel_open_stream(Tunnel *t, unsigned sid) {
   }
 }
 
+/* The device pings every 5s and drops the link after 15s of silence, so
+ * answering PING is mandatory — without it the link cannot survive 15
+ * seconds. We also ping outward so a half-open link (reports connected,
+ * passes no data) gets torn down here rather than lingering. */
+static DWORD WINAPI heartbeat_thread(LPVOID arg) {
+  Tunnel *t = (Tunnel *)arg;
+  while (!t->dead) {
+    Sleep(5000);
+    if (t->dead) break;
+    tunnel_send(t, 4, 0, NULL, 0);
+    if (difftime(time(NULL), t->last_pong) > 15) {
+      logline("heartbeat: no pong in 15s - link dead, closing");
+      t->dead = 1;
+      shutdown(t->rf, SD_BOTH);
+      break;
+    }
+  }
+  return 0;
+}
+
 static void tunnel_run(Tunnel *t) {
   char buf[8192], frame[CHUNK + 16];
   unsigned have = 0;
@@ -426,6 +448,10 @@ static void tunnel_run(Tunnel *t) {
       } else if (type == 3) {
         int slot = slot_for(t, sid, 0);
         if (slot >= 0) { closesocket(t->conns[slot]); t->conns[slot] = INVALID_SOCKET; }
+      } else if (type == 4) {
+        tunnel_send(t, 5, 0, NULL, 0);   /* PING -> PONG */
+      } else if (type == 5) {
+        t->last_pong = time(NULL);       /* PONG */
       }
       memmove(buf, buf + 7 + len, have - 7 - len);
       have -= 7 + len;
@@ -609,7 +635,9 @@ int main(void) {
       t.rf = rf;
       for (i = 0; i < MAX_STREAMS; i++) t.conns[i] = INVALID_SOCKET;
       InitializeCriticalSection(&t.wlock);
+      t.last_pong = time(NULL);
       g_tun = &t;
+      CloseHandle(CreateThread(NULL, 0, heartbeat_thread, &t, 0, NULL));
       tunnel_run(&t);
       g_tun = NULL;
       DeleteCriticalSection(&t.wlock);
