@@ -788,16 +788,13 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     sendFrame(6, 0, payload)
   }
 
+  /// Runs on q (called from drainFrames) — must NOT q.sync, that traps.
   private func applyHello(_ payload: Data) {
     guard payload.count >= 11 else { return }
     let bytes = [UInt8](payload)
-    let version = bytes[0]
-    let caps = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
-    q.sync {
-      peerVersion = version
-      peerCaps = caps
-    }
-    log("device speaks v\(version) caps=0x\(String(format: "%04x", caps))")
+    peerVersion = bytes[0]
+    peerCaps = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
+    log("device speaks v\(peerVersion) caps=0x\(String(format: "%04x", peerCaps))")
   }
 
   /// True once the device has told us it accepts computer-originated streams.

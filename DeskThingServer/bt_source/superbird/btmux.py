@@ -91,6 +91,11 @@ class Mux:
         self.streams = {}
         # Streams the COMPUTER opened into this device.
         self.inbound = {}
+        # Inbound streams still connecting. Opening a local service is async,
+        # and the peer sends its first payload straight after OPEN — without
+        # somewhere to park those bytes they are lost and the far end waits
+        # forever for a reply to a request we dropped.
+        self.opening = {}
         self.next_id = 1
         self.wlock = asyncio.Lock()
         self.last_pong = time.time()
@@ -144,17 +149,37 @@ class Mux:
             return
 
         host, port = SERVICES[target[1]]
+        # Start buffering immediately: DATA for this stream can arrive while
+        # the connect below is still in flight.
+        self.opening[sid] = []
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=5)
         except Exception:
             print('mux: inbound %s unreachable' % target[1], flush=True)
+            self.opening.pop(sid, None)
             await self.send(7, sid, bytes([ACK_UNREACHABLE]))
             return
 
+        # The peer may have closed while we were connecting.
+        if sid not in self.opening:
+            try:
+                w.close()
+            except Exception:
+                pass
+            return
+
+        early = self.opening.pop(sid)
         self.inbound[sid] = w
         await self.send(7, sid, bytes([ACK_OK]))
         print('mux: inbound stream %d -> %s' % (sid, target[1]), flush=True)
+        for chunk in early:
+            w.write(chunk)
+        if early:
+            try:
+                await w.drain()
+            except Exception:
+                pass
         asyncio.ensure_future(self.pump_inbound(sid, r, w))
 
     async def pump_inbound(self, sid, r, w):
@@ -184,6 +209,7 @@ class Mux:
         return self.streams.get(sid) or self.inbound.get(sid)
 
     def drop(self, sid):
+        self.opening.pop(sid, None)
         w = self.streams.pop(sid, None) or self.inbound.pop(sid, None)
         if w is not None:
             try:
@@ -283,6 +309,13 @@ class Mux:
                         print('mux: peer refused stream %d (code %d)'
                               % (sid, payload[0]), flush=True)
                         self.drop(sid)
+                    continue
+                if sid in self.opening:
+                    # Still connecting: park DATA, honor an early CLOSE.
+                    if t == 2:
+                        self.opening[sid].append(payload)
+                    elif t == 3:
+                        self.opening.pop(sid, None)
                     continue
                 w = self.writer_for(sid)
                 if t == 2 and w is not None:
