@@ -184,6 +184,63 @@ class InboundRelay(unittest.TestCase):
         self.assertIn(CLOSE, [t for t, _, _ in frames])
 
 
+class EarlyDataRace(unittest.TestCase):
+    """Opening a local service is async, and a peer sends its first payload
+    straight after OPEN. Those bytes must be parked, not dropped — losing them
+    leaves the far end waiting forever for a reply to a request that was
+    silently discarded. Found on hardware: chromium connected but never saw
+    the HTTP request."""
+
+    def setUp(self):
+        self.mod = load_mux()
+        self.loop = FakeLoop()
+        self.mux = self.mod.Mux(sock=None, loop=self.loop)
+
+    def test_data_arriving_mid_connect_is_delivered(self):
+        got = []
+
+        async def scenario():
+            async def handler(reader, writer):
+                got.append(await reader.read(64))
+                writer.write(b'ok')
+                await writer.drain()
+                writer.close()
+
+            server = await asyncio.start_server(handler, '127.0.0.1', 0)
+            port = server.sockets[0].getsockname()[1]
+            self.mod.SERVICES['test'] = ('127.0.0.1', port)
+            try:
+                # Start the open, then push DATA before it can finish.
+                task = asyncio.ensure_future(
+                    self.mux.open_inbound(NS | 5, bytes([KIND_SERVICE, 4]) + b'test'))
+                await asyncio.sleep(0)          # let it register as 'opening'
+                self.assertIn(NS | 5, self.mux.opening,
+                              'stream should be parked while connecting')
+                self.mux.opening[NS | 5].append(b'GET /hello')
+                await task
+                for _ in range(50):
+                    await asyncio.sleep(0.02)
+                    if got:
+                        break
+            finally:
+                server.close()
+                self.mod.SERVICES.pop('test', None)
+
+        run(scenario())
+        self.assertEqual(got, [b'GET /hello'],
+                         'bytes buffered during connect were not delivered')
+
+    def test_close_during_connect_abandons_the_stream(self):
+        self.mux.opening[NS | 9] = []
+        self.mux.drop(NS | 9)
+        self.assertNotIn(NS | 9, self.mux.opening)
+
+    def test_unreachable_service_clears_the_buffer(self):
+        acks = run(self.mux.open_inbound(NS | 3, bytes([KIND_SERVICE, 7]) + b'pairing'))
+        self.assertEqual(self.mux.opening, {},
+                         'a failed open must not leak its buffer')
+
+
 class HelloExchange(unittest.TestCase):
     def setUp(self):
         self.mod = load_mux()
