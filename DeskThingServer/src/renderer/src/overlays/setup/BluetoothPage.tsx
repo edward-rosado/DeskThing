@@ -154,8 +154,13 @@ const BluetoothPage: React.FC = () => {
                         Pairing failed: {pairing.error}. Try again.
                       </span>
                     )}
-                    Scan for the device, then pair — a code will appear on its screen for you to
-                    confirm here. The device must be powered on and set up once over USB (below).
+                    Scan for the device, then pair — a matching 6-digit code appears on the Car
+                    Thing&apos;s screen and here. The device must be powered on and set up once over
+                    USB (below).
+                  </p>
+                  <p className="text-gray-500 text-xs mb-4">
+                    On macOS, if the system shows its own Bluetooth pairing request, confirm it there
+                    and check the code matches the device screen — that completes pairing too.
                   </p>
                   <div className="flex gap-3 items-center flex-wrap">
                     <Button

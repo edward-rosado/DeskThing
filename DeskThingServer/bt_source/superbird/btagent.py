@@ -108,30 +108,54 @@ def agent_loop():
         send('discoverable on')
 
         peer = None
+        # bluetoothctl's agent prompts ("Confirm passkey NNNNNN (yes/no):")
+        # do NOT end with a newline — they sit waiting for input. Reading
+        # lines would block forever on exactly the event we exist to catch,
+        # so read raw chunks and scan an accumulating tail instead.
+        buf = ''
         try:
-            for raw in iter(lambda: proc.stdout.readline(), b''):
-                line = raw.decode('utf-8', 'replace')
-                m = RE_PEER.search(line)
+            while True:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                buf += chunk.decode('utf-8', 'replace')
+                m = RE_PEER.search(buf)
                 if m:
                     peer = m.group(1)
-                m = RE_CONFIRM.search(line) or RE_PASSKEY.search(line)
+                m = RE_CONFIRM.search(buf) or RE_PASSKEY.search(buf)
                 if m:
                     set_state(active=True, passkey=m.group(1), result=None, peer=peer)
-                    send('yes')
+                    # Answer after a beat, not instantly: replying within
+                    # milliseconds races the initiator's own confirmation
+                    # prompt setup (observed on macOS — its user prompt never
+                    # surfaces and pairing dies with an unspecified HCI
+                    # error). The delay also guarantees the code is on the
+                    # device screen long enough for the person to compare it
+                    # before either side completes the exchange.
+                    threading.Timer(3.5, lambda: send('yes')).start()
+                    buf = ''
                     continue
-                if RE_AUTHORIZE.search(line):
+                if RE_AUTHORIZE.search(buf):
                     send('yes')
+                    buf = ''
                     continue
-                if RE_PAIRED.search(line):
+                if RE_PAIRED.search(buf):
                     if get_state()['active']:
                         set_state(active=False, result='ok', peer=peer)
                         # Trust the newly paired peer so it can reconnect
                         # without re-authorization after every boot.
                         if peer:
                             send('trust ' + peer)
+                    buf = ''
                     continue
-                if RE_FAILED.search(line):
+                if RE_FAILED.search(buf):
                     set_state(active=False, passkey=None, result='failed', peer=peer)
+                    buf = ''
+                    continue
+                # Bound the scan window; keep enough tail to complete a
+                # pattern split across reads.
+                if len(buf) > 8192:
+                    buf = buf[-1024:]
         except Exception:
             pass
         finally:

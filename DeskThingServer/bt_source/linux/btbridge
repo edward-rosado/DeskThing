@@ -197,18 +197,22 @@ class Pairer:
         send('pair ' + address)
 
         deadline = time.time() + 60
+        # bluetoothctl's agent prompts do not end with a newline (they wait
+        # for input), so read raw chunks and scan an accumulating tail.
+        buf = ''
         try:
             while time.time() < deadline:
-                raw = proc.stdout.readline()
-                if not raw:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
                     break
-                line = raw.decode('utf-8', 'replace')
-                m = RE_CONFIRM.search(line)
+                buf += chunk.decode('utf-8', 'replace')
+                m = RE_CONFIRM.search(buf)
                 if m:
                     STATE.pairing_code = m.group(1)
                     STATE.pairing_stage = 'confirm'
+                    buf = ''
                     continue
-                if RE_OK.search(line):
+                if RE_OK.search(buf):
                     send('trust ' + address)
                     time.sleep(1)
                     STATE.pairing_stage = 'done'
@@ -217,10 +221,12 @@ class Pairer:
                         STATE.device_address = address
                     STATE.save()
                     return
-                if RE_FAIL.search(line):
+                if RE_FAIL.search(buf):
                     STATE.pairing_stage = 'failed'
-                    STATE.pairing_error = line.strip()[-120:]
+                    STATE.pairing_error = buf.strip()[-120:]
                     return
+                if len(buf) > 8192:
+                    buf = buf[-1024:]
             if STATE.pairing_stage not in ('done', 'failed'):
                 STATE.pairing_stage = 'failed'
                 STATE.pairing_error = 'timed out'

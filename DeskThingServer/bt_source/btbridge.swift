@@ -241,6 +241,14 @@ final class Pairer: NSObject, IOBluetoothDevicePairDelegate {
   static let shared = Pairer()
   private var pair: IOBluetoothDevicePair?
   private var address: String?
+  /// The radio-level outcome, once known. IOBluetoothDevicePair's deferred
+  /// replyUserConfirmation never reaches the controller (verified with btmon:
+  /// the reply command is simply never sent, and the exchange times out after
+  /// 30s), so the numeric comparison is accepted inside the callback and the
+  /// person's code check becomes the wizard's gate instead: Confirm completes
+  /// the wizard, "doesn't match" unpairs on the spot.
+  private var radioResult: IOReturn?
+  private var userAccepted: Bool?
 
   func begin(address raw: String) {
     let addr = normalizeAddress(raw)
@@ -258,6 +266,8 @@ final class Pairer: NSObject, IOBluetoothDevicePairDelegate {
       // any existing record before pairing fresh.
       if dev.isPaired() { Unpairer.unpair(addr) }
       self.address = addr
+      self.radioResult = nil
+      self.userAccepted = nil
       State.shared.pairingStage = .connecting
       State.shared.pairingCode = nil
       State.shared.pairingError = nil
@@ -282,16 +292,38 @@ final class Pairer: NSObject, IOBluetoothDevicePairDelegate {
 
   func reply(accept: Bool) {
     DispatchQueue.main.async {
-      guard let p = self.pair else { return }
-      log("pairing: user replied \(accept ? "accept" : "reject")")
-      State.shared.pairingStage = .finishing
-      p.replyUserConfirmation(accept)
+      self.userAccepted = accept
+      log("pairing: user replied \(accept ? "codes match" : "codes do not match")")
       if !accept {
-        p.stop()
+        // The person says the codes differ: whatever the radio concluded,
+        // this bond must not survive.
+        self.pair?.stop()
         self.pair = nil
+        if let addr = self.address { Unpairer.unpair(addr) }
         State.shared.pairingStage = .failed
+        State.shared.pairingCode = nil
         State.shared.pairingError = "rejected"
+        return
       }
+      switch self.radioResult {
+      case .some(kIOReturnSuccess):
+        self.finalizeSuccess()
+      case .none:
+        // Radio still finishing; devicePairingFinished completes the wizard.
+        State.shared.pairingStage = .finishing
+      case .some:
+        break // already reported failed
+      }
+    }
+  }
+
+  private func finalizeSuccess() {
+    log("pairing: complete")
+    State.shared.pairingStage = .done
+    State.shared.pairingCode = nil
+    if let addr = address {
+      State.shared.deviceAddress = addr
+      State.shared.save()
     }
   }
 
@@ -300,6 +332,9 @@ final class Pairer: NSObject, IOBluetoothDevicePairDelegate {
     log("pairing: confirm code \(code) (device is showing the same code)")
     State.shared.pairingCode = code
     State.shared.pairingStage = .confirm
+    // Accept at the radio level now — the deferred reply path never delivers
+    // (see radioResult above). The person's confirmation gates the wizard.
+    (sender as? IOBluetoothDevicePair)?.replyUserConfirmation(true)
   }
 
   func devicePairingPINCodeRequest(_ sender: Any!) {
@@ -314,13 +349,19 @@ final class Pairer: NSObject, IOBluetoothDevicePairDelegate {
 
   func devicePairingFinished(_ sender: Any!, error: IOReturn) {
     pair = nil
+    radioResult = error
     if error == kIOReturnSuccess {
-      log("pairing: finished OK")
-      State.shared.pairingStage = .done
-      State.shared.pairingCode = nil
-      if let addr = address {
-        State.shared.deviceAddress = addr
-        State.shared.save()
+      log("pairing: radio bond established")
+      switch userAccepted {
+      case .some(true):
+        finalizeSuccess()
+      case .some(false):
+        // Already rejected and unpaired in reply().
+        break
+      case .none:
+        // Keep showing the code until the person answers; stage stays
+        // confirm and reply() finishes the job.
+        break
       }
     } else {
       log("pairing: failed (\(error))")
@@ -641,6 +682,14 @@ func runBridgeLoop() -> Never {
     guard let addr = State.shared.deviceAddress,
           let device = IOBluetoothDevice(addressString: addr) else {
       // Nothing paired yet; wait for the UI to run the pairing flow.
+      Thread.sleep(forTimeInterval: 3)
+      continue
+    }
+
+    guard device.isPaired() else {
+      // Known address but no bond: connecting now would fire an SSP exchange
+      // of its own and collide with the wizard's — pairing owns the radio
+      // until the bond exists.
       Thread.sleep(forTimeInterval: 3)
       continue
     }
