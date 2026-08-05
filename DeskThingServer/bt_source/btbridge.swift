@@ -5,7 +5,11 @@ import Network
 // DeskThing Bluetooth bridge (Mac side).
 // Connects to the Car Thing's RFCOMM channel 3 and demuxes tunneled TCP
 // streams onto localhost:8891 (the DeskThing server).
-// Frame: type(1) streamID(4 BE) len(2 BE) payload. 1=OPEN 2=DATA 3=CLOSE.
+// Frame: type(1) streamID(4 BE) len(2 BE) payload. 1=OPEN 2=DATA 3=CLOSE
+// 4=PING 5=PONG. PING/PONG is a liveness heartbeat: after a device reboot the
+// Mac can hold a half-open RFCOMM channel that reports connected but passes no
+// data. A peer that stops ponging is dead, so we close the channel and let the
+// reconnect loop re-establish it.
 //
 // Also serves a control API on 127.0.0.1:8899 for the DeskThing UI:
 //   GET  /status                    transport + pairing snapshot
@@ -510,8 +514,15 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
   // writeSync blocks while the RFCOMM link drains. It must never run on `q`,
   // or inbound frames can't be processed and both directions deadlock.
   private let writeQueue = DispatchQueue(label: "bridge.write")
+  // The heartbeat runs on its own queue, never writeQueue: a half-open channel
+  // can block writeSync there indefinitely, and the staleness check must still
+  // fire to close the dead link.
+  private let heartbeatQueue = DispatchQueue(label: "bridge.heartbeat")
   private var mtu: UInt16 = 990
   var closed = false
+  private var opened = false
+  private var lastPong = Date()
+  private var heartbeatTimer: DispatchSourceTimer?
 
   func rfcommChannelOpenComplete(_ ch: IOBluetoothRFCOMMChannel, status error: IOReturn) {
     if error != kIOReturnSuccess {
@@ -522,12 +533,46 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     channel = ch
     mtu = ch.getMTU()
     log("rfcomm open, mtu=\(mtu)")
+    q.sync { opened = true }
     State.shared.linkUp = true
     preferBluetooth()
+    startHeartbeat()
+  }
+
+  func isOpened() -> Bool { q.sync { opened } }
+
+  // A half-open channel reports open but never delivers data and never fires
+  // rfcommChannelClosed. Ping the device; if it stops answering, the link is
+  // dead — close so the reconnect loop takes over.
+  private func startHeartbeat() {
+    q.sync { lastPong = Date() }
+    let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
+    timer.schedule(deadline: .now() + 5, repeating: 5)
+    timer.setEventHandler { [weak self] in
+      guard let self = self else { return }
+      let silent = Date().timeIntervalSince(self.q.sync { self.lastPong })
+      if silent > 15 {
+        log("heartbeat: no pong in \(Int(silent))s — link dead, closing")
+        self.channel?.close()
+        self.q.sync { self.closed = true }
+        self.stopHeartbeat()
+        return
+      }
+      // Enqueue the ping without blocking this queue on writeSync.
+      self.sendFrame(4, 0, Data())
+    }
+    heartbeatTimer = timer
+    timer.resume()
+  }
+
+  private func stopHeartbeat() {
+    heartbeatTimer?.cancel()
+    heartbeatTimer = nil
   }
 
   func rfcommChannelClosed(_ ch: IOBluetoothRFCOMMChannel) {
     log("rfcomm closed")
+    stopHeartbeat()
     State.shared.linkUp = false
     fallBackToUSB()
     q.sync {
@@ -560,6 +605,8 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
       case 3:
         conns[sid]?.cancel()
         conns.removeValue(forKey: sid)
+      case 4: sendFrame(5, 0, Data())  // PING -> PONG
+      case 5: lastPong = Date()        // PONG from device
       default:
         log("bad frame type \(t), resetting buffer")
         rxBuf.removeAll()
@@ -681,24 +728,32 @@ func runBridgeLoop() -> Never {
 
     guard let addr = State.shared.deviceAddress,
           let device = IOBluetoothDevice(addressString: addr) else {
-      // Nothing paired yet; wait for the UI to run the pairing flow.
+      // No device chosen yet; wait for the UI to run the pairing flow.
       Thread.sleep(forTimeInterval: 3)
       continue
     }
 
-    guard device.isPaired() else {
-      // Known address but no bond: connecting now would fire an SSP exchange
-      // of its own and collide with the wizard's — pairing owns the radio
-      // until the bond exists.
-      Thread.sleep(forTimeInterval: 3)
-      continue
-    }
-
+    // Don't gate on device.isPaired() here: it false-negatives on modern
+    // macOS even for a bonded device, which would strand the reconnect loop.
+    // The pairingStage guard above already keeps us off the radio during an
+    // active pairing; outside that, just attempt the open — if there is no
+    // bond it fails harmlessly and we retry.
     let bridge = Bridge()
     var channel: IOBluetoothRFCOMMChannel?
     log("connecting to \(addr) rfcomm ch\(rfcommChannelID)...")
-    let res = device.openRFCOMMChannelSync(&channel, withChannelID: rfcommChannelID, delegate: bridge)
-    if res == kIOReturnSuccess {
+    // openRFCOMMChannelSync's return value is unreliable: it frequently reports
+    // a failure (e.g. -536870212) while the channel actually opens a moment
+    // later and rfcommChannelOpenComplete fires success. Treat the delegate as
+    // the source of truth — wait briefly for it to report open or closed rather
+    // than trusting the synchronous return, or the retry would reset a link
+    // that is really coming up.
+    _ = device.openRFCOMMChannelSync(&channel, withChannelID: rfcommChannelID, delegate: bridge)
+    let deadline = Date().addingTimeInterval(8)
+    while !bridge.isOpened() && !bridge.isClosed() && Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    }
+
+    if bridge.isOpened() {
       log("connected")
       while !bridge.isClosed() && State.shared.preference == .bluetooth {
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
@@ -707,12 +762,15 @@ func runBridgeLoop() -> Never {
       channel?.close()
       device.closeConnection()
       State.shared.linkUp = false
+      Thread.sleep(forTimeInterval: 2)
     } else {
-      log("connect failed (\(res)); device off/out of range? retrying in 10s")
+      log("connect did not open; device off/out of range? retrying in 10s")
+      channel?.close()
+      device.closeConnection()
       State.shared.linkUp = false
       // No Bluetooth link, so make sure the USB path is available if the cable is in.
       fallBackToUSB()
+      Thread.sleep(forTimeInterval: 10)
     }
-    Thread.sleep(forTimeInterval: 10)
   }
 }

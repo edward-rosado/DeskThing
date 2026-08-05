@@ -132,7 +132,7 @@ def agent_loop():
                     # error). The delay also guarantees the code is on the
                     # device screen long enough for the person to compare it
                     # before either side completes the exchange.
-                    threading.Timer(3.5, lambda: send('yes')).start()
+                    threading.Timer(5.0, lambda: send('yes')).start()
                     buf = ''
                     continue
                 if RE_AUTHORIZE.search(buf):
