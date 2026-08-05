@@ -69,9 +69,12 @@ export class SongCache extends EventEmitter<SongCacheEventMap> {
 
     const playbackFlipped = this.currentSong.is_playing !== newSong.is_playing
 
-    // A seek is a progress jump larger than elapsed playback can explain. It
-    // matters because it moves the end of the track, so the timer must be
-    // rearmed — an ordinary tick must not be.
+    // A seek is a progress jump larger than playback alone can explain. The
+    // comparison is against the cached value rather than the last polled one
+    // because the progress interval above keeps the cache advancing in real
+    // time — so this is already "where the track should be by now", and an
+    // ordinary poll lands within the tolerance no matter how long the gap
+    // between polls is.
     const jumped =
       Math.abs((newSong.track_progress ?? 0) - (this.currentSong.track_progress ?? 0)) >
       SongCache.SEEK_TOLERANCE_MS

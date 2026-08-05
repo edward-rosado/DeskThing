@@ -72,6 +72,22 @@ describe('SongCache', () => {
       expect(changed).toHaveBeenCalledTimes(1)
     })
 
+    it('does not mistake a long gap between polls for a seek', () => {
+      // The cached progress advances in real time, so comparing against it
+      // stays correct however far apart the polls are. Comparing against the
+      // last *polled* value instead would make every poll longer than the
+      // tolerance — i.e. every poll at the default 15s cadence — look like a
+      // seek, and rearm the end-of-track timer each time.
+      const changed = vi.fn()
+      cache.updateSong(track({ track_progress: 10000 }))
+      cache.on(SongCacheEvents.SONG_CHANGED, changed)
+
+      vi.advanceTimersByTime(15000)
+      cache.updateSong(track({ track_progress: 25000 }))
+
+      expect(changed).not.toHaveBeenCalled()
+    })
+
     it('treats a seek as a change, because it moves the end of the track', () => {
       const changed = vi.fn()
       cache.updateSong(track())
