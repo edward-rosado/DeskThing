@@ -22,6 +22,14 @@ import { ColorExtractor } from './ColorExtractor'
  * Core service that manages music playback functionality
  */
 export class MusicService implements MusicStoreClass {
+  /**
+   * When to ask after playback is expected to have changed. The first attempt
+   * is immediate; the rest cover the provider's own lag in reporting the new
+   * track, which is around a second in practice. Three attempts, then give up
+   * and let the scheduled refresh handle it.
+   */
+  private static readonly TRACK_CHANGE_RETRY_DELAYS_MS = [0, 1200, 2500]
+
   private refreshInterval: NodeJS.Timeout | null = null
   private currentApp: string | null = null
   private songCache: SongCache
@@ -172,12 +180,15 @@ export class MusicService implements MusicStoreClass {
         }
         break
 
-      // These requests don't need cache updates, just pass through
+      // A skip has the same shape as a track boundary: we know playback is
+      // about to be something else, but the provider will keep reporting the
+      // old track for a moment. Asking once loses that race and drops the user
+      // back onto the scheduled refresh, so chase it the same way.
       case AUDIO_REQUESTS.NEXT:
       case AUDIO_REQUESTS.PREVIOUS:
       case AUDIO_REQUESTS.REWIND:
       case AUDIO_REQUESTS.FAST_FORWARD:
-        this.refreshMusicData()
+        this.chaseTrackChange()
         break
       case AUDIO_REQUESTS.LIKE:
       case AUDIO_REQUESTS.VOLUME:
@@ -234,12 +245,57 @@ export class MusicService implements MusicStoreClass {
 
     // Listen for song end events
     this.songCache.on(SongCacheEvents.SONG_ENDED, () => {
-      this.refreshMusicData()
+      this.chaseTrackChange()
     })
 
-    this.songCache.on(SongCacheEvents.SONG_CHANGED, (data) => {
-      this.refreshMusicData(data)
-    })
+    // NOTE: SONG_CHANGED deliberately does not broadcast. handleMusicPayload
+    // already broadcasts every payload it caches, and it broadcasts the
+    // normalised copy — the one whose thumbnail has been rewritten to a URL
+    // the client can actually fetch. Broadcasting again from here sent the raw
+    // payload as a second, worse copy of the same update.
+  }
+
+  /**
+   * Ask again, briefly, until the track we were told ended is actually gone.
+   *
+   * Asking once at the boundary reliably fails: the provider still reports the
+   * finishing track for around a second afterwards, the change-detect gate
+   * sees nothing new, and the update waits for the next scheduled poll — which
+   * is how a one-second gap became a fifteen-second one.
+   *
+   * The ladder is short and stops the moment it has an answer, because an
+   * unbounded retry at a track boundary is exactly how an account earns a
+   * multi-hour Retry-After.
+   */
+  private async chaseTrackChange(): Promise<void> {
+    const leaving = this.songCache.getCurrentSong()
+    const leavingId = leaving?.id
+    const leavingName = leaving?.track_name
+
+    for (const delay of MusicService.TRACK_CHANGE_RETRY_DELAYS_MS) {
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+
+      await this.refreshMusicData(undefined, { force: true })
+
+      const now = this.songCache.getCurrentSong()
+      if (!now) continue
+
+      // Stop when the track is genuinely different. Repeat-one replays the
+      // same id, so a progress collapse counts as a change too — otherwise the
+      // ladder would run to exhaustion on every looped track.
+      const isDifferent = now.id !== leavingId || now.track_name !== leavingName
+      const restarted =
+        leaving?.track_progress != null &&
+        now.track_progress != null &&
+        now.track_progress < leaving.track_progress
+
+      if (isDifferent || restarted) return
+
+      // Nothing is playing any more — there is no next track to wait for.
+      if (now.is_playing === false) return
+    }
   }
 
   private handleMusicPayload = async (songData: SongData): Promise<void> => {
@@ -404,7 +460,10 @@ export class MusicService implements MusicStoreClass {
     return this.currentApp
   }
 
-  private async refreshMusicData(songData?: SongData): Promise<void> {
+  private async refreshMusicData(
+    songData?: SongData,
+    options: { force?: boolean } = {}
+  ): Promise<void> {
     if (songData) {
       await this.platformStore.broadcastToClients({
         type: DESKTHING_DEVICE.MUSIC,
@@ -426,7 +485,11 @@ export class MusicService implements MusicStoreClass {
       await this.appStore.sendDataToApp(currentApp, {
         type: SongEvent.GET,
         request: AUDIO_REQUESTS.REFRESH,
-        app: 'music'
+        app: 'music',
+        // Tells the source not to answer from a coalesced in-flight request.
+        // Only set when we already know playback changed, so the ordinary
+        // cadence keeps its de-duplication.
+        payload: options.force || undefined
       })
       Logger.log(LOGGING_LEVELS.LOG, `Refreshed music data from ${currentApp}`)
     } catch (error) {
