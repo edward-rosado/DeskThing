@@ -151,6 +151,14 @@ forward so Bluetooth carries the traffic; when the link drops (or the user pins
 USB) the helper restores it. The preference and device address persist in the
 platform's app-data dir (`bt-transport.json`).
 
+## Debugging the device over the link
+
+Protocol v2's `cdp` service forwards the device's chromium debugger to a
+loopback port, which is the only way to see its screen — the firmware has no
+`screencap`. `tools/carthing-debug.py` wraps that (screenshot, evaluate JS,
+stream the console) and works over Bluetooth or USB. See
+[`docs/device-debugging.md`](../../docs/device-debugging.md).
+
 ## Tests
 
 - `npm run test:bt` — the TypeScript layer (IPC dispatch, manager, control-API
