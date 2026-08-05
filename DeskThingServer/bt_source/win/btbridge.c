@@ -29,6 +29,24 @@
 #define CHUNK 660
 #define MAX_STREAMS 64
 
+/* --- protocol v2 --------------------------------------------------------
+ * v1 was one-directional: only the device opened streams, always to the
+ * DeskThing server. v2 lets either side open, and an OPEN carries a target.
+ * The stream-ID space is split by its high bit so both ends can allocate
+ * without coordinating: the device keeps the low half, we take the high half. */
+#define PROTOCOL_VERSION 2
+#define NS_MASK 0x80000000u
+#define CAP_INBOUND 0x0001
+#define CAP_TARGETED 0x0002
+#define OUR_CAPS (CAP_INBOUND | CAP_TARGETED)
+#define KIND_SERVICE 0x01
+#define ACK_OK 0
+#define MAX_FORWARDS 4
+
+/* Services on the DEVICE this computer may open. The device enforces the same
+ * list independently; this copy lets us refuse early. */
+static const char *DEVICE_SERVICES[] = { "cdp", "pairing", NULL };
+
 static CRITICAL_SECTION g_lock;
 
 /* ---- shared state ------------------------------------------------- */
@@ -331,7 +349,21 @@ typedef struct {
   CRITICAL_SECTION wlock;
   volatile int dead;
   volatile time_t last_pong;
+  volatile unsigned char peer_version;   /* 1 until a HELLO says otherwise */
+  volatile unsigned peer_caps;
+  volatile unsigned next_sid;
 } Tunnel;
+
+static int tunnel_supports_inbound(Tunnel *t) {
+  return t && t->peer_version >= 2 && (t->peer_caps & CAP_INBOUND);
+}
+
+static int service_is_known(const char *name) {
+  int i;
+  for (i = 0; DEVICE_SERVICES[i]; i++)
+    if (!strcmp(DEVICE_SERVICES[i], name)) return 1;
+  return 0;
+}
 
 static Tunnel *g_tun = NULL;
 
@@ -403,6 +435,31 @@ static void tunnel_open_stream(Tunnel *t, unsigned sid) {
   }
 }
 
+/* Announce our version/caps and hand the device our clock — it has no RTC,
+ * and a wrong clock breaks TLS from the device in confusing ways. */
+static void tunnel_send_hello(Tunnel *t) {
+  char p[11];
+  unsigned long long epoch = (unsigned long long)time(NULL);
+  int i;
+  p[0] = (char)PROTOCOL_VERSION;
+  p[1] = (char)((OUR_CAPS >> 8) & 0xff);
+  p[2] = (char)(OUR_CAPS & 0xff);
+  for (i = 0; i < 8; i++) p[3 + i] = (char)((epoch >> (8 * (7 - i))) & 0xff);
+  tunnel_send(t, 6, 0, p, sizeof(p));
+}
+
+/* Allocate in our half of the id space; wraps inside the high half so it can
+ * never stray into the device's. */
+static unsigned tunnel_alloc_sid(Tunnel *t) {
+  unsigned n;
+  EnterCriticalSection(&t->wlock);
+  t->next_sid = (t->next_sid + 1) & 0x7FFFFFFFu;
+  if (t->next_sid == 0) t->next_sid = 1;
+  n = t->next_sid | NS_MASK;
+  LeaveCriticalSection(&t->wlock);
+  return n;
+}
+
 /* The device pings every 5s and drops the link after 15s of silence, so
  * answering PING is mandatory — without it the link cannot survive 15
  * seconds. We also ping outward so a half-open link (reports connected,
@@ -452,7 +509,26 @@ static void tunnel_run(Tunnel *t) {
         tunnel_send(t, 5, 0, NULL, 0);   /* PING -> PONG */
       } else if (type == 5) {
         t->last_pong = time(NULL);       /* PONG */
+      } else if (type == 6) {            /* HELLO */
+        if (len >= 11) {
+          t->peer_version = (unsigned char)buf[7];
+          t->peer_caps = ((unsigned char)buf[8] << 8) | (unsigned char)buf[9];
+          logline("device speaks v%u caps=0x%04x",
+                  (unsigned)t->peer_version, t->peer_caps);
+        }
+      } else if (type == 7) {            /* OPEN_ACK for a stream we opened */
+        if (len >= 1 && (unsigned char)buf[7] != ACK_OK) {
+          int slot = slot_for(t, sid, 0);
+          logline("device refused stream %u (code %u)", sid,
+                  (unsigned)(unsigned char)buf[7]);
+          if (slot >= 0) {
+            closesocket(t->conns[slot]);
+            t->conns[slot] = INVALID_SOCKET;
+          }
+        }
       }
+      /* Any other type is from a newer peer: skip the frame. Its bytes are
+       * already consumed below, so the streams that follow stay intact. */
       memmove(buf, buf + 7 + len, have - 7 - len);
       have -= 7 + len;
     }
@@ -460,6 +536,140 @@ static void tunnel_run(Tunnel *t) {
   t->dead = 1;
   for (i = 0; i < MAX_STREAMS; i++)
     if (t->conns[i] != INVALID_SOCKET) { closesocket(t->conns[i]); t->conns[i] = INVALID_SOCKET; }
+}
+
+/* ---- device service forwarding -----------------------------------------
+ *
+ * Exposes a named service on the DEVICE as a plain TCP port here, so ordinary
+ * tools work unmodified — point chrome://inspect at the forwarded port and you
+ * are debugging the Car Thing over Bluetooth, no cable. */
+
+typedef struct {
+  char name[32];
+  SOCKET listener;
+  unsigned short port;
+  volatile int stop;
+} Forward;
+
+static Forward g_forwards[MAX_FORWARDS];
+
+/* Open a stream to a named device service, bridged to a local connection. */
+static void tunnel_open_device_service(Tunnel *t, const char *name, SOCKET local) {
+  unsigned sid = tunnel_alloc_sid(t);
+  int slot = slot_for(t, sid, 1);
+  size_t n = strlen(name);
+  char payload[34];
+  PumpArg *arg;
+  if (slot < 0 || n > 32) { closesocket(local); return; }
+  t->conns[slot] = local;
+  t->ids[slot] = sid;
+  payload[0] = (char)KIND_SERVICE;
+  payload[1] = (char)n;
+  memcpy(payload + 2, name, n);
+  tunnel_send(t, 1, sid, payload, (unsigned)(n + 2));
+  arg = (PumpArg *)malloc(sizeof(PumpArg));
+  arg->t = t;
+  arg->slot = slot;
+  CloseHandle(CreateThread(NULL, 0, stream_pump, arg, 0, NULL));
+}
+
+static DWORD WINAPI forward_accept_thread(LPVOID argp) {
+  Forward *f = (Forward *)argp;
+  while (!f->stop) {
+    SOCKET client = accept(f->listener, NULL, NULL);
+    if (client == INVALID_SOCKET) break;
+    if (!g_tun || !tunnel_supports_inbound(g_tun)) { closesocket(client); continue; }
+    tunnel_open_device_service(g_tun, f->name, client);
+  }
+  closesocket(f->listener);
+  f->listener = INVALID_SOCKET;
+  return 0;
+}
+
+/* Returns the local port, or 0 with *err set. */
+static unsigned short forward_open(const char *name, const char **err) {
+  struct sockaddr_in sa;
+  int len = sizeof(sa), i, free_i = -1;
+  SOCKET srv;
+  for (i = 0; i < MAX_FORWARDS; i++) {
+    if (g_forwards[i].listener != INVALID_SOCKET && !strcmp(g_forwards[i].name, name))
+      return g_forwards[i].port;
+    if (g_forwards[i].listener == INVALID_SOCKET && free_i < 0) free_i = i;
+  }
+  if (!service_is_known(name)) { *err = "unknown service"; return 0; }
+  if (!g_tun || !tunnel_supports_inbound(g_tun)) {
+    *err = "device does not support inbound streams";
+    return 0;
+  }
+  if (free_i < 0) { *err = "too many forwards"; return 0; }
+
+  srv = socket(AF_INET, SOCK_STREAM, 0);
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  /* Loopback only: this is a doorway into the device and must not be
+   * reachable from the network. */
+  sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+  sa.sin_port = 0;
+  if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0 || listen(srv, 4) != 0) {
+    closesocket(srv);
+    *err = "could not bind a local port";
+    return 0;
+  }
+  len = sizeof(sa);
+  getsockname(srv, (struct sockaddr *)&sa, &len);
+
+  strncpy(g_forwards[free_i].name, name, sizeof(g_forwards[free_i].name) - 1);
+  g_forwards[free_i].listener = srv;
+  g_forwards[free_i].port = ntohs(sa.sin_port);
+  g_forwards[free_i].stop = 0;
+  CloseHandle(CreateThread(NULL, 0, forward_accept_thread, &g_forwards[free_i], 0, NULL));
+  logline("forward: device '%s' available on 127.0.0.1:%u", name,
+          (unsigned)g_forwards[free_i].port);
+  return g_forwards[free_i].port;
+}
+
+/* Rendered into /status so the UI knows what is reachable. Static buffers are
+ * fine here: only the control thread builds these. */
+static const char *services_json(void) {
+  static char buf[256];
+  int i;
+  buf[0] = 0;
+  if (!tunnel_supports_inbound(g_tun)) return buf;
+  for (i = 0; DEVICE_SERVICES[i]; i++) {
+    char item[64];
+    snprintf(item, sizeof(item), "%s{\"name\":\"%s\"}",
+             buf[0] ? "," : "", DEVICE_SERVICES[i]);
+    if (strlen(buf) + strlen(item) < sizeof(buf) - 1) strcat(buf, item);
+  }
+  return buf;
+}
+
+static const char *forwards_json(void) {
+  static char buf[256];
+  int i;
+  buf[0] = 0;
+  for (i = 0; i < MAX_FORWARDS; i++) {
+    char item[96];
+    if (g_forwards[i].listener == INVALID_SOCKET) continue;
+    snprintf(item, sizeof(item), "%s{\"service\":\"%s\",\"port\":%u}",
+             buf[0] ? "," : "", g_forwards[i].name, (unsigned)g_forwards[i].port);
+    if (strlen(buf) + strlen(item) < sizeof(buf) - 1) strcat(buf, item);
+  }
+  return buf;
+}
+
+static void forward_close(const char *name) {
+  int i;
+  for (i = 0; i < MAX_FORWARDS; i++) {
+    if (g_forwards[i].listener != INVALID_SOCKET &&
+        (!name || !strcmp(g_forwards[i].name, name))) {
+      g_forwards[i].stop = 1;
+      closesocket(g_forwards[i].listener);
+      g_forwards[i].listener = INVALID_SOCKET;
+      g_forwards[i].port = 0;
+      logline("forward: stopped '%s'", g_forwards[i].name);
+    }
+  }
 }
 
 /* ---- control API ------------------------------------------------------- */
@@ -513,6 +723,34 @@ static void control_respond(SOCKET c, const char *req) {
       LeaveCriticalSection(&g_lock);
       logline("device address set to %s by UI", val);
     }
+  } else if (!strncmp(req, "POST /forward/open", 18)) {
+    char small[256];
+    const char *err = NULL;
+    unsigned short port = 0;
+    if (json_str(json, "service", val, sizeof(val)))
+      port = forward_open(val, &err);
+    else
+      err = "missing service";
+    if (err)
+      snprintf(small, sizeof(small), "{\"ok\":false,\"error\":\"%s\"}", err);
+    else
+      snprintf(small, sizeof(small),
+               "{\"ok\":true,\"service\":\"%s\",\"port\":%u}", val, (unsigned)port);
+    snprintf(out, sizeof(out),
+             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+             "Content-Length: %u\r\nConnection: close\r\n\r\n%s",
+             (unsigned)strlen(small), small);
+    send(c, out, (int)strlen(out), 0);
+    return;
+  } else if (!strncmp(req, "POST /forward/close", 19)) {
+    const char *body_ok = "{\"ok\":true}";
+    if (json_str(json, "service", val, sizeof(val))) forward_close(val);
+    snprintf(out, sizeof(out),
+             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+             "Content-Length: %u\r\nConnection: close\r\n\r\n%s",
+             (unsigned)strlen(body_ok), body_ok);
+    send(c, out, (int)strlen(out), 0);
+    return;
   }
 
   EnterCriticalSection(&g_lock);
@@ -520,7 +758,9 @@ static void control_respond(SOCKET c, const char *req) {
            "{\"preference\":\"%s\",\"transport\":\"%s\",\"linkUp\":%s,"
            "\"deviceAddress\":%s%s%s,\"paired\":%s,"
            "\"pairing\":{\"stage\":\"%s\",\"code\":%s%s%s,\"error\":%s%s%s},"
-           "\"found\":[%s]}",
+           "\"found\":[%s],"
+           "\"protocol\":{\"version\":%d,\"inbound\":%s},"
+           "\"services\":[%s],\"forwards\":[%s]}",
            g_preference, active_transport(), g_link_up ? "true" : "false",
            g_device_address[0] ? "\"" : "", g_device_address[0] ? g_device_address : "null",
            g_device_address[0] ? "\"" : "",
@@ -530,7 +770,10 @@ static void control_respond(SOCKET c, const char *req) {
            g_pairing_code[0] ? "\"" : "",
            g_pairing_error[0] ? "\"" : "", g_pairing_error[0] ? g_pairing_error : "null",
            g_pairing_error[0] ? "\"" : "",
-           g_found);
+           g_found,
+           PROTOCOL_VERSION,
+           tunnel_supports_inbound(g_tun) ? "true" : "false",
+           services_json(), forwards_json());
   LeaveCriticalSection(&g_lock);
 
   snprintf(out, sizeof(out),
@@ -582,6 +825,16 @@ int main(void) {
   g_pair_reply_event = CreateEventA(NULL, FALSE, FALSE, NULL);
   state_path_init();
   state_load();
+  /* Static storage zero-initializes, and 0 is a VALID socket value — the
+   * forward table must start as explicitly-empty or an unopened slot looks
+   * like a live listener. */
+  {
+    int k;
+    for (k = 0; k < MAX_FORWARDS; k++) {
+      g_forwards[k].listener = INVALID_SOCKET;
+      g_forwards[k].port = 0;
+    }
+  }
   logline("state loaded: preference=%s device=%s", g_preference,
           g_device_address[0] ? g_device_address : "unset");
 
@@ -636,9 +889,16 @@ int main(void) {
       for (i = 0; i < MAX_STREAMS; i++) t.conns[i] = INVALID_SOCKET;
       InitializeCriticalSection(&t.wlock);
       t.last_pong = time(NULL);
+      t.peer_version = 1;   /* until a HELLO says otherwise */
+      t.peer_caps = 0;
+      t.next_sid = 0;
       g_tun = &t;
       CloseHandle(CreateThread(NULL, 0, heartbeat_thread, &t, 0, NULL));
+      /* A v1 device ignores the unknown frame type and keeps working. */
+      tunnel_send_hello(&t);
       tunnel_run(&t);
+      /* The streams behind any forwarded ports died with the link. */
+      forward_close(NULL);
       g_tun = NULL;
       DeleteCriticalSection(&t.wlock);
     }

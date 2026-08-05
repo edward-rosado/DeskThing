@@ -22,7 +22,9 @@ const clientMock = vi.hoisted(() => ({
   startBridgePairing: vi.fn(),
   replyBridgePairing: vi.fn(),
   removeBridgePairing: vi.fn(),
-  setBridgeDevice: vi.fn()
+  setBridgeDevice: vi.fn(),
+  openBridgeForward: vi.fn(),
+  closeBridgeForward: vi.fn()
 }))
 vi.mock('../../../../src/main/services/bluetooth/bridgeClient', () => clientMock)
 
@@ -105,6 +107,50 @@ describe('bluetoothManager (helper present)', () => {
     provisionMock.mockResolvedValue({ success: false, steps: [] })
     await bluetoothManager.provision('serial')
     expect(clientMock.setBridgeDevice).not.toHaveBeenCalled()
+  })
+
+  it('surfaces protocol and service info when the device speaks v2', async () => {
+    clientMock.fetchBridgeState.mockResolvedValue({
+      ...HELPER_STATE,
+      protocol: { version: 2, inbound: true },
+      services: [{ name: 'cdp', label: 'Chromium remote debugging' }],
+      forwards: [{ service: 'cdp', port: 51234 }]
+    })
+    const status = await bluetoothManager.getStatus()
+    expect(status.protocol).toEqual({ version: 2, inbound: true })
+    expect(status.services).toHaveLength(1)
+    expect(status.forwards?.[0]).toEqual({ service: 'cdp', port: 51234 })
+  })
+
+  it('reports no services against a v1 device', async () => {
+    // The old helper's /status has no protocol block at all.
+    const status = await bluetoothManager.getStatus()
+    expect(status.protocol).toBeUndefined()
+    expect(status.services).toEqual([])
+    expect(status.forwards).toEqual([])
+  })
+
+  it('opens a forward through the helper', async () => {
+    clientMock.openBridgeForward.mockResolvedValue({ ok: true, service: 'cdp', port: 51234 })
+    const result = await bluetoothManager.openForward('cdp')
+    expect(clientMock.openBridgeForward).toHaveBeenCalledWith('cdp')
+    expect(result).toEqual({ ok: true, service: 'cdp', port: 51234 })
+  })
+
+  it('passes a helper refusal straight through', async () => {
+    clientMock.openBridgeForward.mockResolvedValue({
+      ok: false,
+      error: 'device does not support inbound streams'
+    })
+    const result = await bluetoothManager.openForward('cdp')
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/inbound/)
+  })
+
+  it('closes a forward then re-reads status', async () => {
+    await bluetoothManager.closeForward('cdp')
+    expect(clientMock.closeBridgeForward).toHaveBeenCalledWith('cdp')
+    expect(clientMock.fetchBridgeState).toHaveBeenCalled()
   })
 
   it('forwards pairing calls to the helper', async () => {

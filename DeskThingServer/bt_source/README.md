@@ -52,9 +52,75 @@ payload (struct layout `>BIH`):
 
 | Field | Size | Meaning |
 | --- | --- | --- |
-| type | 1 byte | 1 = OPEN, 2 = DATA, 3 = CLOSE |
-| streamID | 4 bytes BE | Stream identifier; streams originate device-side only |
+| type | 1 byte | see the table below |
+| streamID | 4 bytes BE | Stream identifier; high bit marks who opened it |
 | len | 2 bytes BE | Payload length |
+
+| Type | Name | Payload |
+| --- | --- | --- |
+| 1 | OPEN | target descriptor (empty = the DeskThing server) |
+| 2 | DATA | stream bytes |
+| 3 | CLOSE | — |
+| 4 | PING | — |
+| 5 | PONG | — |
+| 6 | HELLO | version(1) caps(2 BE) epoch(8 BE) |
+| 7 | OPEN_ACK | status(1) |
+
+An unknown type must be **skipped**, never treated as a desync — its bytes are
+already framed, and discarding the buffer would corrupt every other live
+stream. That is what lets a v1 and a v2 peer interoperate.
+
+### Direction and stream IDs
+
+v1 was one-directional: only the device opened streams, always to the DeskThing
+server. v2 lets either side open. The 32-bit ID space is split by its high bit
+so both ends allocate without coordinating:
+
+- `0x00000001 … 0x7FFFFFFF` — opened by the **device**
+- `0x80000001 … 0xFFFFFFFF` — opened by the **computer**
+
+Allocation wraps inside its own half. An OPEN whose ID is in the wrong half is
+refused with `ACK_BAD_NAMESPACE`; a collision would silently cross-wire two live
+TCP streams.
+
+### HELLO and capabilities
+
+Both sides send HELLO when a session opens. Capability bits: `0x01` INBOUND
+(accepts computer-originated streams), `0x02` TARGETED (understands OPEN
+descriptors), `0x04` INET (will proxy `host:port` — reserved for internet
+sharing). A peer that never sends HELLO is assumed to be v1, and the link
+behaves exactly as it did before.
+
+The computer's HELLO carries its clock. The Car Thing has no RTC and nothing
+else sets its time; a wrong clock fails every TLS handshake the device ever
+makes, in ways that look like a tunnel bug.
+
+### OPEN target descriptors
+
+| Payload | Meaning |
+| --- | --- |
+| empty | the DeskThing server (identical to v1) |
+| `0x01 len name` | a **named service** on the peer |
+| `0x02 len host port(2 BE)` | a literal `host:port` (reserved for internet sharing) |
+
+Named services are the only form accepted by default, in either direction. The
+device is not a router: a name that is not in its registry is refused, so
+`127.0.0.1:5037` is *inexpressible* rather than merely filtered. The descriptor
+parse is a trust boundary — every implementation rejects malformed input rather
+than guessing, and `test/test_protocol.py` locks the rejection cases.
+
+### Device service registry
+
+What the **computer** may open on the device (default deny):
+
+| Name | Target | Why |
+| --- | --- | --- |
+| `cdp` | 127.0.0.1:2222 | chromium remote debugging — the only way to screenshot a device with no `screencap` |
+| `pairing` | 127.0.0.1:8892 | pairing agent status |
+
+Port **8891 is permanently absent** and must stay that way: it is the mux's own
+listener, so an inbound stream there would be handed back to `handle_local` and
+forwarded over the link again — an unbounded loop that eats the whole radio.
 
 Golden vectors live in `test/test_protocol.py`; every implementation must
 match them. macOS caps the RFCOMM MTU at 667 bytes (L2CAP default 672 − 5);
@@ -72,6 +138,8 @@ payloads, not the protocol.
 | `POST /pair/reply {"accept"}` | Answer the numeric-comparison prompt |
 | `POST /unpair {"address"}` | Remove a bond |
 | `POST /device {"address"}` | Set the device the bridge connects to |
+| `POST /forward/open {"service"}` | Expose a device service as a loopback port; returns `{ok, port}` |
+| `POST /forward/close {"service"}` | Tear that forward down |
 
 The main process (`src/main/services/bluetooth/`) consumes this API and exposes
 it to the renderer over typed IPC; nothing else should call it directly.

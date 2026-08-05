@@ -4,6 +4,7 @@ import {
   BluetoothIPCData,
   BluetoothHandlerReturnMap,
   BluetoothBridgeStatus,
+  BluetoothForwardResult,
   BluetoothPreference,
   BluetoothProvisionResult
 } from '@shared/types'
@@ -56,6 +57,21 @@ export const bluetooth = {
       type: IPC_BLUETOOTH_TYPES.UNPAIR,
       request: 'set',
       payload: { address }
+    }),
+  /** Expose a device service as a loopback port on this computer. */
+  openForward: async (service: string): Promise<BluetoothForwardResult> =>
+    await sendCommand({
+      kind: IPC_HANDLERS.BLUETOOTH,
+      type: IPC_BLUETOOTH_TYPES.OPEN_FORWARD,
+      request: 'set',
+      payload: { service }
+    }),
+  closeForward: async (service: string): Promise<BluetoothBridgeStatus> =>
+    await sendCommand({
+      kind: IPC_HANDLERS.BLUETOOTH,
+      type: IPC_BLUETOOTH_TYPES.CLOSE_FORWARD,
+      request: 'set',
+      payload: { service }
     })
 }
 

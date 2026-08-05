@@ -32,6 +32,34 @@ export interface BluetoothFoundDevice {
   name: string
 }
 
+/** What the tunnel itself can do, once the peer has introduced itself. */
+export interface BluetoothProtocolInfo {
+  /** Wire version this computer speaks. */
+  version: number
+  /** Whether the paired device accepts computer-originated streams. */
+  inbound: boolean
+}
+
+/** A service on the device that this computer may open a stream to. */
+export interface BluetoothDeviceService {
+  name: string
+  label?: string
+}
+
+/** A device service currently exposed as a local TCP port. */
+export interface BluetoothForward {
+  service: string
+  port: number
+}
+
+export interface BluetoothForwardResult {
+  ok: boolean
+  service?: string
+  /** Loopback port on this computer that now reaches the device service. */
+  port?: number
+  error?: string
+}
+
 export interface BluetoothBridgeStatus {
   /** Whether this platform ships a Bluetooth bridge helper at all. */
   supported: boolean
@@ -47,6 +75,12 @@ export interface BluetoothBridgeStatus {
   paired: boolean
   pairing: BluetoothPairingState
   found: BluetoothFoundDevice[]
+  /** Absent when talking to a helper that predates protocol v2. */
+  protocol?: BluetoothProtocolInfo
+  /** Services the device is willing to expose; empty unless inbound is on. */
+  services?: BluetoothDeviceService[]
+  /** Services currently forwarded to a local port. */
+  forwards?: BluetoothForward[]
 }
 
 export interface BluetoothProvisionStep {
@@ -70,7 +104,9 @@ export enum IPC_BLUETOOTH_TYPES {
   DISCOVER = 'discover',
   PAIR = 'pair',
   PAIR_REPLY = 'pair-reply',
-  UNPAIR = 'unpair'
+  UNPAIR = 'unpair',
+  OPEN_FORWARD = 'open-forward',
+  CLOSE_FORWARD = 'close-forward'
 }
 
 export type BluetoothIPCData = {
@@ -109,6 +145,16 @@ export type BluetoothIPCData = {
       request: 'set'
       payload: { address: string }
     }
+  | {
+      type: IPC_BLUETOOTH_TYPES.OPEN_FORWARD
+      request: 'set'
+      payload: { service: string }
+    }
+  | {
+      type: IPC_BLUETOOTH_TYPES.CLOSE_FORWARD
+      request: 'set'
+      payload: { service: string }
+    }
 )
 
 export type BluetoothHandlerReturnMap = {
@@ -119,6 +165,8 @@ export type BluetoothHandlerReturnMap = {
   [IPC_BLUETOOTH_TYPES.PAIR]: BluetoothBridgeStatus
   [IPC_BLUETOOTH_TYPES.PAIR_REPLY]: BluetoothBridgeStatus
   [IPC_BLUETOOTH_TYPES.UNPAIR]: BluetoothBridgeStatus
+  [IPC_BLUETOOTH_TYPES.OPEN_FORWARD]: BluetoothForwardResult
+  [IPC_BLUETOOTH_TYPES.CLOSE_FORWARD]: BluetoothBridgeStatus
 }
 
 export type BluetoothHandlerReturnType<K extends IPC_BLUETOOTH_TYPES> = BluetoothHandlerReturnMap[K]

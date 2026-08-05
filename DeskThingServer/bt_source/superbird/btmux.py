@@ -23,20 +23,173 @@ LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8891
 RFCOMM_CHANNEL = 3
 CHUNK = 660  # frame + 7-byte header stays within the 667-byte RFCOMM MTU
 
+# --- protocol v2 -----------------------------------------------------------
+PROTOCOL_VERSION = 2
+NS_MASK = 0x80000000        # set = the computer opened it, clear = we did
+CAP_INBOUND = 1 << 0
+CAP_TARGETED = 1 << 1
+OUR_CAPS = CAP_INBOUND | CAP_TARGETED
+
+KIND_SERVICE = 0x01
+KIND_HOSTPORT = 0x02
+
+ACK_OK, ACK_REFUSED, ACK_UNREACHABLE, ACK_UNKNOWN_SERVICE, ACK_BAD_NAMESPACE = range(5)
+
+# What the COMPUTER is allowed to reach on this device. Default deny: a name
+# that is not in this table is refused, so adding a service is a deliberate act
+# and a hostile peer cannot address arbitrary local ports.
+#
+# 8891 is deliberately absent and must stay that way: it is our own listener,
+# so an inbound stream to it would be handed to handle_local and forwarded
+# straight back over the link — an unbounded loop that eats the whole radio.
+SERVICES = {
+    'cdp': ('127.0.0.1', 2222),      # chromium remote debugging
+    'pairing': ('127.0.0.1', 8892),  # the pairing agent's status endpoint
+}
+
+
+def parse_target(payload):
+    """Decode an OPEN target descriptor.
+
+    Returns ('legacy',), ('service', name) or ('hostport', host, port).
+    Raises ValueError on anything malformed — this is a trust boundary, so it
+    rejects rather than guesses.
+    """
+    if not payload:
+        return ('legacy',)
+    kind = payload[0]
+    if kind == KIND_SERVICE:
+        if len(payload) < 2:
+            raise ValueError('truncated')
+        n = payload[1]
+        if n == 0 or len(payload) != 2 + n:
+            raise ValueError('bad length')
+        name = payload[2:2 + n].decode('ascii', 'replace')
+        if not all(c.islower() or c.isdigit() or c == '-' for c in name):
+            raise ValueError('bad charset')
+        return ('service', name)
+    if kind == KIND_HOSTPORT:
+        if len(payload) < 2:
+            raise ValueError('truncated')
+        n = payload[1]
+        if n == 0 or len(payload) != 2 + n + 2:
+            raise ValueError('bad length')
+        host = payload[2:2 + n].decode('ascii', 'replace')
+        port = struct.unpack('>H', payload[2 + n:])[0]
+        if port == 0:
+            raise ValueError('bad port')
+        return ('hostport', host, port)
+    raise ValueError('unknown kind %d' % kind)
+
 
 class Mux:
     def __init__(self, sock, loop):
         self.sock = sock
         self.loop = loop
+        # Streams WE opened (the DeskThing client reaching the computer). The
+        # watchdog counts these, so inbound streams must not live here.
         self.streams = {}
+        # Streams the COMPUTER opened into this device.
+        self.inbound = {}
         self.next_id = 1
         self.wlock = asyncio.Lock()
         self.last_pong = time.time()
+        self.peer_version = 1        # assume v1 until a HELLO says otherwise
+        self.peer_caps = 0
 
     async def send(self, t, sid, payload=b''):
         async with self.wlock:
             await self.loop.sock_sendall(
                 self.sock, struct.pack('>BIH', t, sid, len(payload)) + payload)
+
+    async def send_hello(self):
+        # The device has no real-time clock, so it advertises epoch 0 and takes
+        # the computer's word for the time.
+        await self.send(6, 0, struct.pack('>BHQ', PROTOCOL_VERSION, OUR_CAPS, 0))
+
+    def apply_hello(self, payload):
+        if len(payload) < 11:
+            return
+        version, caps, epoch = struct.unpack('>BHQ', payload[:11])
+        self.peer_version, self.peer_caps = version, caps
+        print('mux: peer speaks v%d caps=0x%04x' % (version, caps), flush=True)
+        # Fix our clock from the computer's. Nothing else on this device sets
+        # the time, and a wrong clock fails every TLS handshake later in ways
+        # that look like a tunnel bug.
+        if epoch and abs(time.time() - epoch) > 60:
+            subprocess.call(['date', '-s', '@%d' % epoch],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print('mux: clock set from peer (%d)' % epoch, flush=True)
+
+    async def open_inbound(self, sid, payload):
+        """The computer wants to reach a service on this device."""
+        # IDs the computer mints must carry its namespace bit; anything else is
+        # a broken or hostile peer and could collide with our own streams.
+        if not (sid & NS_MASK):
+            await self.send(7, sid, bytes([ACK_BAD_NAMESPACE]))
+            return
+        try:
+            target = parse_target(payload)
+        except ValueError as e:
+            print('mux: rejecting inbound open: %s' % e, flush=True)
+            await self.send(7, sid, bytes([ACK_UNKNOWN_SERVICE]))
+            return
+
+        if target[0] != 'service':
+            # The device is not a router: it only ever exposes named services.
+            await self.send(7, sid, bytes([ACK_REFUSED]))
+            return
+        if target[1] not in SERVICES:
+            await self.send(7, sid, bytes([ACK_UNKNOWN_SERVICE]))
+            return
+
+        host, port = SERVICES[target[1]]
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5)
+        except Exception:
+            print('mux: inbound %s unreachable' % target[1], flush=True)
+            await self.send(7, sid, bytes([ACK_UNREACHABLE]))
+            return
+
+        self.inbound[sid] = w
+        await self.send(7, sid, bytes([ACK_OK]))
+        print('mux: inbound stream %d -> %s' % (sid, target[1]), flush=True)
+        asyncio.ensure_future(self.pump_inbound(sid, r, w))
+
+    async def pump_inbound(self, sid, r, w):
+        """Relay a computer-opened stream from the device service back out."""
+        try:
+            while True:
+                data = await r.read(CHUNK)
+                if not data:
+                    break
+                await self.send(2, sid, data)
+        except Exception:
+            pass
+        finally:
+            if self.inbound.pop(sid, None) is not None:
+                try:
+                    await self.send(3, sid)
+                except Exception:
+                    pass
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    def writer_for(self, sid):
+        """Either direction — the namespaces cannot collide, so one lookup
+        covering both maps is unambiguous."""
+        return self.streams.get(sid) or self.inbound.get(sid)
+
+    def drop(self, sid):
+        w = self.streams.pop(sid, None) or self.inbound.pop(sid, None)
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
 
     async def handle_local(self, r, w):
         # Read the first bytes before opening a tunnel stream so that a probe for
@@ -119,7 +272,19 @@ class Mux:
                 if t == 5:  # PONG from the Mac
                     self.last_pong = time.time()
                     continue
-                w = self.streams.get(sid)
+                if t == 6:  # HELLO — capability + clock exchange
+                    self.apply_hello(payload)
+                    continue
+                if t == 1:  # the computer is opening a stream into us
+                    asyncio.ensure_future(self.open_inbound(sid, payload))
+                    continue
+                if t == 7:  # OPEN_ACK for a stream we opened
+                    if payload and payload[0] != ACK_OK:
+                        print('mux: peer refused stream %d (code %d)'
+                              % (sid, payload[0]), flush=True)
+                        self.drop(sid)
+                    continue
+                w = self.writer_for(sid)
                 if t == 2 and w is not None:
                     w.write(payload)
                     try:
@@ -127,11 +292,10 @@ class Mux:
                     except Exception:
                         pass
                 elif t == 3 and w is not None:
-                    del self.streams[sid]
-                    try:
-                        w.close()
-                    except Exception:
-                        pass
+                    self.drop(sid)
+                # Any other type is from a newer peer: skip the frame, never
+                # touch the buffer. Its bytes are already consumed above, so
+                # the streams that follow stay intact.
 
     async def heartbeat(self):
         """Ping the Mac; if it stops ponging the link is dead — raise to end
@@ -187,6 +351,12 @@ async def session(conn):
     wd_task = asyncio.ensure_future(client_watchdog())
     hb_task = asyncio.ensure_future(mux.heartbeat())
     pump_task = asyncio.ensure_future(mux.pump_rfcomm())
+    # Announce ourselves. A v1 computer ignores the unknown frame type and the
+    # link keeps working exactly as before.
+    try:
+        await mux.send_hello()
+    except Exception:
+        pass
     try:
         done, _pending = await asyncio.wait(
             [pump_task, hb_task], return_when=asyncio.FIRST_EXCEPTION)
@@ -201,12 +371,13 @@ async def session(conn):
             task.cancel()
         if state['server'] is not None:
             state['server'].close()
-        for w in list(mux.streams.values()):
+        for w in list(mux.streams.values()) + list(mux.inbound.values()):
             try:
                 w.close()
             except Exception:
                 pass
         mux.streams.clear()
+        mux.inbound.clear()
         try:
             conn.close()
         except Exception:

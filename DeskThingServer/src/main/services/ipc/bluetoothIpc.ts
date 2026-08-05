@@ -23,5 +23,9 @@ export const bluetoothHandler = async (
       return await bluetoothManager.pairReply(data.payload.accept)
     case IPC_BLUETOOTH_TYPES.UNPAIR:
       return await bluetoothManager.unpair(data.payload.address)
+    case IPC_BLUETOOTH_TYPES.OPEN_FORWARD:
+      return await bluetoothManager.openForward(data.payload.service)
+    case IPC_BLUETOOTH_TYPES.CLOSE_FORWARD:
+      return await bluetoothManager.closeForward(data.payload.service)
   }
 }

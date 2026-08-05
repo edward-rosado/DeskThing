@@ -38,6 +38,22 @@ CHUNK = 660  # frame + 7-byte header stays near the typical RFCOMM MTU
 PING_INTERVAL_S = 5
 PONG_DEADLINE_S = 15
 
+# --- protocol v2 -----------------------------------------------------------
+PROTOCOL_VERSION = 2
+NS_MASK = 0x80000000        # set = we opened it, clear = the device did
+CAP_INBOUND = 1 << 0
+CAP_TARGETED = 1 << 1
+OUR_CAPS = CAP_INBOUND | CAP_TARGETED
+KIND_SERVICE = 0x01
+ACK_OK = 0
+
+# Services on the DEVICE this computer may open. The device enforces the same
+# list independently; this copy lets us refuse early.
+DEVICE_SERVICES = {
+    'cdp': 'Chromium remote debugging',
+    'pairing': 'Pairing agent status',
+}
+
 STATE_DIR = os.path.join(
     os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), 'deskthing')
 STATE_PATH = os.path.join(STATE_DIR, 'bt-transport.json')
@@ -77,6 +93,8 @@ class State:
         self.pairing_code = None
         self.pairing_error = None
         self.found = []
+        self.tunnel = None       # the live Tunnel, when a link is up
+        self.forwards = {}       # service name -> local port
         self.load()
 
     def load(self):
@@ -132,6 +150,16 @@ class State:
                     'error': self.pairing_error,
                 },
                 'found': list(self.found),
+                'protocol': {
+                    'version': PROTOCOL_VERSION,
+                    'inbound': bool(self.tunnel and self.tunnel.supports_inbound()),
+                },
+                'services': (
+                    [{'name': n, 'label': l} for n, l in sorted(DEVICE_SERVICES.items())]
+                    if (self.tunnel and self.tunnel.supports_inbound()) else []
+                ),
+                'forwards': [{'service': n, 'port': p}
+                             for n, p in sorted(self.forwards.items())],
             }
 
 
@@ -301,6 +329,72 @@ def unpair(address):
     STATE.save()
 
 
+# ------------------------------------------------- device service forwarding
+#
+# Exposes a named service on the DEVICE as a plain TCP port here, so ordinary
+# tools work unmodified — point chrome://inspect at the forwarded port and you
+# are debugging the Car Thing over Bluetooth, no cable.
+
+_forward_listeners = {}
+
+
+def open_forward(name):
+    """Returns (port, error)."""
+    if name in STATE.forwards:
+        return STATE.forwards[name], None
+    if name not in DEVICE_SERVICES:
+        return 0, 'unknown service'
+    tunnel = STATE.tunnel
+    if tunnel is None or not tunnel.supports_inbound():
+        return 0, 'device does not support inbound streams'
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Loopback only: this is a doorway into the device and must not be
+    # reachable from the network.
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+
+    def accept_loop():
+        while name in _forward_listeners:
+            try:
+                client, _ = srv.accept()
+            except OSError:
+                break
+            tunnel = STATE.tunnel
+            if tunnel is None or not tunnel.supports_inbound():
+                client.close()
+                continue
+            tunnel.open_device_service(name, client)
+        try:
+            srv.close()
+        except OSError:
+            pass
+
+    _forward_listeners[name] = srv
+    STATE.forwards[name] = port
+    threading.Thread(target=accept_loop, daemon=True).start()
+    log("forward: device '%s' available on 127.0.0.1:%d" % (name, port))
+    return port, None
+
+
+def close_forward(name):
+    srv = _forward_listeners.pop(name, None)
+    STATE.forwards.pop(name, None)
+    if srv is not None:
+        try:
+            srv.close()
+        except OSError:
+            pass
+        log("forward: stopped '%s'" % name)
+
+
+def close_all_forwards():
+    for name in list(_forward_listeners):
+        close_forward(name)
+
+
 # ------------------------------------------------------------ control API
 
 def control_server():
@@ -356,6 +450,25 @@ def handle_control(conn):
                     STATE.device_address = body['address'].replace('-', ':').upper()
                 STATE.save()
                 log('device address set to %s by UI' % STATE.device_address)
+        elif req.startswith('POST /forward/open'):
+            name = body.get('service')
+            port, err = open_forward(name) if isinstance(name, str) else (0, 'missing service')
+            payload = json.dumps(
+                {'ok': False, 'error': err} if err
+                else {'ok': True, 'service': name, 'port': port}).encode()
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+                         b'Content-Length: ' + str(len(payload)).encode() +
+                         b'\r\nConnection: close\r\n\r\n' + payload)
+            return
+        elif req.startswith('POST /forward/close'):
+            name = body.get('service')
+            if isinstance(name, str):
+                close_forward(name)
+            payload = b'{"ok":true}'
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+                         b'Content-Length: ' + str(len(payload)).encode() +
+                         b'\r\nConnection: close\r\n\r\n' + payload)
+            return
 
         payload = json.dumps(STATE.snapshot()).encode()
         conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
@@ -383,6 +496,44 @@ class Tunnel:
         self.wlock = threading.Lock()
         self.dead = threading.Event()
         self.last_pong = time.time()
+        self.peer_version = 1     # assume v1 until a HELLO says otherwise
+        self.peer_caps = 0
+        self.next_sid = 0
+        self.sid_lock = threading.Lock()
+
+    def send_hello(self):
+        """Announce our version/caps and hand the device our clock — it has no
+        RTC, and a wrong clock breaks TLS from the device in confusing ways."""
+        self.send_frame(6, 0, struct.pack('>BHQ', PROTOCOL_VERSION, OUR_CAPS,
+                                          int(time.time())))
+
+    def apply_hello(self, payload):
+        if len(payload) < 11:
+            return
+        version, caps, _epoch = struct.unpack('>BHQ', payload[:11])
+        self.peer_version, self.peer_caps = version, caps
+        log('device speaks v%d caps=0x%04x' % (version, caps))
+
+    def supports_inbound(self):
+        return self.peer_version >= 2 and bool(self.peer_caps & CAP_INBOUND)
+
+    def alloc_sid(self):
+        """Allocate in our half of the id space; wraps inside the high half so
+        it can never stray into the device's."""
+        with self.sid_lock:
+            self.next_sid = (self.next_sid + 1) & 0x7FFFFFFF or 1
+            return self.next_sid | NS_MASK
+
+    def open_device_service(self, name, local_sock):
+        """Open a stream to a named service on the device, bridged to a local
+        TCP connection."""
+        sid = self.alloc_sid()
+        self.conns[sid] = local_sock
+        payload = bytes([KIND_SERVICE, len(name)]) + name.encode('ascii')
+        self.send_frame(1, sid, payload)
+        threading.Thread(target=self.pump_stream, args=(sid, local_sock),
+                         daemon=True).start()
+        return sid
 
     def send_frame(self, t, sid, payload=b''):
         with self.wlock:
@@ -421,6 +572,15 @@ class Tunnel:
                         self.send_frame(5, 0)
                     elif t == 5:  # PONG
                         self.last_pong = time.time()
+                    elif t == 6:  # HELLO
+                        self.apply_hello(payload)
+                    elif t == 7:  # OPEN_ACK for a stream we opened
+                        if payload and payload[0] != ACK_OK:
+                            log('device refused stream %d (code %d)'
+                                % (sid, payload[0]))
+                            self.close_stream(sid, notify=False)
+                    # Anything else is from a newer peer: skip the frame. Its
+                    # bytes are already consumed, so following streams survive.
         except OSError:
             pass
         finally:
@@ -524,7 +684,13 @@ def bridge_loop():
         prefer_bluetooth()
         tunnel = Tunnel(sock)
         threading.Thread(target=tunnel.heartbeat, daemon=True).start()
+        # A v1 device ignores the unknown frame type and keeps working.
+        tunnel.send_hello()
+        STATE.tunnel = tunnel
         tunnel.pump_rfcomm()
+        STATE.tunnel = None
+        # The streams behind any forwarded ports died with the link.
+        close_all_forwards()
         tunnel.close()
         log('session ended')
         STATE.link_up = False
