@@ -29,6 +29,33 @@ export const bluetooth = {
       type: IPC_BLUETOOTH_TYPES.PROVISION_DEVICE,
       request: 'set',
       payload: { adbId }
+    }),
+  discover: async (): Promise<BluetoothBridgeStatus> =>
+    await sendCommand({
+      kind: IPC_HANDLERS.BLUETOOTH,
+      type: IPC_BLUETOOTH_TYPES.DISCOVER,
+      request: 'set'
+    }),
+  pair: async (address: string): Promise<BluetoothBridgeStatus> =>
+    await sendCommand({
+      kind: IPC_HANDLERS.BLUETOOTH,
+      type: IPC_BLUETOOTH_TYPES.PAIR,
+      request: 'set',
+      payload: { address }
+    }),
+  pairReply: async (accept: boolean): Promise<BluetoothBridgeStatus> =>
+    await sendCommand({
+      kind: IPC_HANDLERS.BLUETOOTH,
+      type: IPC_BLUETOOTH_TYPES.PAIR_REPLY,
+      request: 'set',
+      payload: { accept }
+    }),
+  unpair: async (address: string): Promise<BluetoothBridgeStatus> =>
+    await sendCommand({
+      kind: IPC_HANDLERS.BLUETOOTH,
+      type: IPC_BLUETOOTH_TYPES.UNPAIR,
+      request: 'set',
+      payload: { address }
     })
 }
 

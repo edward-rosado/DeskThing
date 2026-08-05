@@ -7,17 +7,21 @@ import Network
 // streams onto localhost:8891 (the DeskThing server).
 // Frame: type(1) streamID(4 BE) len(2 BE) payload. 1=OPEN 2=DATA 3=CLOSE.
 //
-// Also serves a small control API on 127.0.0.1:8899 so the DeskThing UI can
-// show which transport is live and let the user choose which one to prefer.
+// Also serves a control API on 127.0.0.1:8899 for the DeskThing UI:
+//   GET  /status                    transport + pairing snapshot
+//   POST /preference {"preference"} pin traffic to bluetooth|usb
+//   POST /discover                  start an inquiry for nearby devices
+//   POST /pair {"address"}          pair with a device (numeric comparison;
+//                                   the code appears in /status, the device
+//                                   shows the same code on its screen)
+//   POST /pair/reply {"accept"}     answer the numeric-comparison prompt
+//   POST /unpair {"address"}        remove a stale bond
+//   POST /device {"address"}        set the device this bridge connects to
 
-let deviceAddr = "30-e3-d6-05-78-45"
 let rfcommChannelID: UInt8 = 3
 let targetHost = NWEndpoint.Host("127.0.0.1")
 let targetPort = NWEndpoint.Port(rawValue: 8891)!
 let controlPort = NWEndpoint.Port(rawValue: 8899)!
-
-let adbPath = "/Applications/DeskThing.app/Contents/Resources/mac/adb"
-let deviceSerial = "8550R283Q910"
 
 let prefURL = FileManager.default
   .homeDirectoryForCurrentUser
@@ -29,12 +33,26 @@ func log(_ s: String) {
   fflush(stdout)
 }
 
+/// The bundled adb when we run inside the app, else whatever PATH has.
+let adbPath: String = {
+  let bundled = URL(fileURLWithPath: Bundle.main.bundlePath)
+    .deletingLastPathComponent().appendingPathComponent("adb").path
+  if FileManager.default.isExecutableFile(atPath: bundled) { return bundled }
+  let fallback = "/Applications/DeskThing.app/Contents/Resources/mac/adb"
+  if FileManager.default.isExecutableFile(atPath: fallback) { return fallback }
+  return "adb"
+}()
+
 @discardableResult
 func adb(_ args: [String]) -> Int32 {
-  guard FileManager.default.isExecutableFile(atPath: adbPath) else { return -1 }
   let p = Process()
-  p.executableURL = URL(fileURLWithPath: adbPath)
-  p.arguments = ["-s", deviceSerial] + args
+  if adbPath.contains("/") {
+    p.executableURL = URL(fileURLWithPath: adbPath)
+    p.arguments = args
+  } else {
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = [adbPath] + args
+  }
   p.standardOutput = FileHandle.nullDevice
   p.standardError = FileHandle.nullDevice
   do { try p.run() } catch { return -1 }
@@ -42,13 +60,32 @@ func adb(_ args: [String]) -> Int32 {
   return p.terminationStatus
 }
 
+func normalizeAddress(_ raw: String) -> String {
+  return raw.replacingOccurrences(of: ":", with: "-").lowercased()
+}
+
 // MARK: - Shared state
 
-/// Which transport the user wants. "bluetooth" (default) keeps the wireless link
-/// and tears down the USB reverse while it is up; "usb" pins traffic to the cable.
 enum Preference: String {
   case bluetooth
   case usb
+}
+
+/// Where a pairing attempt currently stands. `confirm` means both sides are
+/// showing the same 6-digit code and the UI must call /pair/reply.
+enum PairingStage: String {
+  case idle
+  case discovering
+  case connecting
+  case confirm
+  case finishing
+  case done
+  case failed
+}
+
+struct FoundDevice {
+  let address: String
+  let name: String
 }
 
 final class State {
@@ -56,6 +93,11 @@ final class State {
   private let q = DispatchQueue(label: "bridge.prefs")
   private var _preference: Preference = .bluetooth
   private var _linkUp = false
+  private var _deviceAddress: String? = nil
+  private var _pairingStage: PairingStage = .idle
+  private var _pairingCode: String? = nil
+  private var _pairingError: String? = nil
+  private var _found: [FoundDevice] = []
 
   var preference: Preference {
     get { q.sync { _preference } }
@@ -65,6 +107,26 @@ final class State {
     get { q.sync { _linkUp } }
     set { q.sync { _linkUp = newValue } }
   }
+  var deviceAddress: String? {
+    get { q.sync { _deviceAddress } }
+    set { q.sync { _deviceAddress = newValue } }
+  }
+  var pairingStage: PairingStage {
+    get { q.sync { _pairingStage } }
+    set { q.sync { _pairingStage = newValue } }
+  }
+  var pairingCode: String? {
+    get { q.sync { _pairingCode } }
+    set { q.sync { _pairingCode = newValue } }
+  }
+  var pairingError: String? {
+    get { q.sync { _pairingError } }
+    set { q.sync { _pairingError = newValue } }
+  }
+  var found: [FoundDevice] {
+    get { q.sync { _found } }
+    set { q.sync { _found = newValue } }
+  }
 
   /// The transport actually carrying data right now. Falling back to USB only
   /// counts if the cable is really there, otherwise nothing is connected.
@@ -73,18 +135,28 @@ final class State {
     return adb(["get-state"]) == 0 ? "usb" : "none"
   }
 
+  var paired: Bool {
+    guard let addr = deviceAddress,
+          let dev = IOBluetoothDevice(addressString: addr) else { return false }
+    return dev.isPaired()
+  }
+
   func load() {
     guard let data = try? Data(contentsOf: prefURL),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let raw = obj["preference"] as? String,
-          let p = Preference(rawValue: raw)
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return }
-    preference = p
-    log("preference loaded: \(p.rawValue)")
+    if let raw = obj["preference"] as? String, let p = Preference(rawValue: raw) {
+      preference = p
+    }
+    if let addr = obj["deviceAddress"] as? String {
+      deviceAddress = normalizeAddress(addr)
+    }
+    log("state loaded: preference=\(preference.rawValue) device=\(deviceAddress ?? "unset")")
   }
 
   func save() {
-    let obj: [String: Any] = ["preference": preference.rawValue]
+    var obj: [String: Any] = ["preference": preference.rawValue]
+    if let addr = deviceAddress { obj["deviceAddress"] = addr }
     guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
     else { return }
     try? FileManager.default.createDirectory(
@@ -112,7 +184,173 @@ func fallBackToUSB() {
       : "transport: USB unavailable (rc=\(rc)) — device likely unplugged")
 }
 
-// MARK: - Control API (consumed by the DeskThing UI)
+// MARK: - Discovery
+
+/// One inquiry at a time; results land in State.found. IOBluetooth delivers
+/// the delegate callbacks on the main run loop, which main keeps servicing.
+final class Discoverer: NSObject, IOBluetoothDeviceInquiryDelegate {
+  static let shared = Discoverer()
+  private var inquiry: IOBluetoothDeviceInquiry?
+
+  func begin() {
+    DispatchQueue.main.async {
+      if self.inquiry != nil { return }
+      State.shared.found = []
+      State.shared.pairingStage = .discovering
+      let inq = IOBluetoothDeviceInquiry(delegate: self)
+      inq?.updateNewDeviceNames = true
+      inq?.inquiryLength = 8
+      self.inquiry = inq
+      let rc = inq?.start() ?? kIOReturnError
+      if rc != kIOReturnSuccess {
+        log("discovery: could not start (\(rc))")
+        self.inquiry = nil
+        State.shared.pairingStage = .idle
+      } else {
+        log("discovery: inquiry started")
+      }
+    }
+  }
+
+  func deviceInquiryDeviceFound(_ sender: IOBluetoothDeviceInquiry!, device: IOBluetoothDevice!) {
+    guard let addr = device.addressString else { return }
+    let name = device.name ?? "Unknown device"
+    var list = State.shared.found
+    if !list.contains(where: { $0.address == addr }) {
+      list.append(FoundDevice(address: addr, name: name))
+      State.shared.found = list
+      log("discovery: found \(name) [\(addr)]")
+    }
+  }
+
+  func deviceInquiryComplete(_ sender: IOBluetoothDeviceInquiry!, error: IOReturn, aborted: Bool) {
+    log("discovery: complete (\(State.shared.found.count) devices)")
+    inquiry = nil
+    if State.shared.pairingStage == .discovering {
+      State.shared.pairingStage = .idle
+    }
+  }
+}
+
+// MARK: - Pairing
+
+/// Computer-initiated pairing, the way the Car Thing originally worked: we ask,
+/// the device's screen shows a 6-digit code, and the person confirms here. The
+/// code surfaces through /status; the UI answers with /pair/reply.
+final class Pairer: NSObject, IOBluetoothDevicePairDelegate {
+  static let shared = Pairer()
+  private var pair: IOBluetoothDevicePair?
+  private var address: String?
+
+  func begin(address raw: String) {
+    let addr = normalizeAddress(raw)
+    DispatchQueue.main.async {
+      if self.pair != nil {
+        log("pairing: already in progress, ignoring")
+        return
+      }
+      guard let dev = IOBluetoothDevice(addressString: addr) else {
+        State.shared.pairingStage = .failed
+        State.shared.pairingError = "bad address"
+        return
+      }
+      // A stale half-bond makes macOS abort right after encryption, so clear
+      // any existing record before pairing fresh.
+      if dev.isPaired() { Unpairer.unpair(addr) }
+      self.address = addr
+      State.shared.pairingStage = .connecting
+      State.shared.pairingCode = nil
+      State.shared.pairingError = nil
+      guard let p = IOBluetoothDevicePair(device: dev) else {
+        State.shared.pairingStage = .failed
+        State.shared.pairingError = "could not create pairing"
+        return
+      }
+      p.delegate = self
+      self.pair = p
+      let rc = p.start()
+      if rc != kIOReturnSuccess {
+        log("pairing: start failed (\(rc))")
+        self.pair = nil
+        State.shared.pairingStage = .failed
+        State.shared.pairingError = "start failed (\(rc))"
+      } else {
+        log("pairing: started with \(addr)")
+      }
+    }
+  }
+
+  func reply(accept: Bool) {
+    DispatchQueue.main.async {
+      guard let p = self.pair else { return }
+      log("pairing: user replied \(accept ? "accept" : "reject")")
+      State.shared.pairingStage = .finishing
+      p.replyUserConfirmation(accept)
+      if !accept {
+        p.stop()
+        self.pair = nil
+        State.shared.pairingStage = .failed
+        State.shared.pairingError = "rejected"
+      }
+    }
+  }
+
+  func devicePairingUserConfirmationRequest(_ sender: Any!, numericValue: BluetoothNumericValue) {
+    let code = String(format: "%06u", numericValue)
+    log("pairing: confirm code \(code) (device is showing the same code)")
+    State.shared.pairingCode = code
+    State.shared.pairingStage = .confirm
+  }
+
+  func devicePairingPINCodeRequest(_ sender: Any!) {
+    // Legacy PIN pairing should not happen with SSP on both sides; refuse
+    // rather than guess a PIN that the headless device can't display.
+    log("pairing: unexpected legacy PIN request, aborting")
+    (sender as? IOBluetoothDevicePair)?.stop()
+    pair = nil
+    State.shared.pairingStage = .failed
+    State.shared.pairingError = "device requested legacy PIN pairing"
+  }
+
+  func devicePairingFinished(_ sender: Any!, error: IOReturn) {
+    pair = nil
+    if error == kIOReturnSuccess {
+      log("pairing: finished OK")
+      State.shared.pairingStage = .done
+      State.shared.pairingCode = nil
+      if let addr = address {
+        State.shared.deviceAddress = addr
+        State.shared.save()
+      }
+    } else {
+      log("pairing: failed (\(error))")
+      State.shared.pairingStage = .failed
+      State.shared.pairingError = "pairing failed (\(error))"
+    }
+  }
+}
+
+/// Bond removal uses the same private IOBluetooth selector blueutil relies on;
+/// there is no public API. Failing quietly is fine — pairing fresh over a stale
+/// bond is what this exists to prevent, and /status shows the outcome.
+enum Unpairer {
+  @discardableResult
+  static func unpair(_ raw: String) -> Bool {
+    let addr = normalizeAddress(raw)
+    guard let dev = IOBluetoothDevice(addressString: addr) else { return false }
+    guard dev.isPaired() else { return true }
+    let sel = Selector(("remove"))
+    guard dev.responds(to: sel) else {
+      log("unpair: private remove selector unavailable")
+      return false
+    }
+    dev.perform(sel)
+    log("unpair: removed bond for \(addr)")
+    return true
+  }
+}
+
+// MARK: - Control API (consumed by the DeskThing server)
 
 final class ControlServer {
   private var listener: NWListener?
@@ -155,32 +393,68 @@ final class ControlServer {
     }
   }
 
+  private func jsonBody(_ request: String) -> [String: Any]? {
+    guard let range = request.range(of: "\r\n\r\n") else { return nil }
+    let json = String(request[range.upperBound...])
+    guard let d = json.data(using: .utf8) else { return nil }
+    return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+  }
+
   private func respond(to request: String) -> String {
     let s = State.shared
 
-    // A preference change arrives as POST /preference {"preference":"usb"}
     if request.hasPrefix("POST /preference") {
-      if let range = request.range(of: "\r\n\r\n") {
-        let json = String(request[range.upperBound...])
-        if let d = json.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-           let raw = obj["preference"] as? String,
-           let p = Preference(rawValue: raw) {
-          s.preference = p
-          s.save()
-          log("preference set to \(p.rawValue) by UI")
-          // Apply immediately rather than waiting for the next reconnect cycle.
-          if p == .usb {
-            fallBackToUSB()
-          } else if s.linkUp {
-            preferBluetooth()
-          }
+      if let obj = jsonBody(request),
+         let raw = obj["preference"] as? String,
+         let p = Preference(rawValue: raw) {
+        s.preference = p
+        s.save()
+        log("preference set to \(p.rawValue) by UI")
+        // Apply immediately rather than waiting for the next reconnect cycle.
+        if p == .usb {
+          fallBackToUSB()
+        } else if s.linkUp {
+          preferBluetooth()
         }
+      }
+    } else if request.hasPrefix("POST /discover") {
+      Discoverer.shared.begin()
+    } else if request.hasPrefix("POST /pair/reply") {
+      if let obj = jsonBody(request), let accept = obj["accept"] as? Bool {
+        Pairer.shared.reply(accept: accept)
+      }
+    } else if request.hasPrefix("POST /pair") {
+      if let obj = jsonBody(request), let addr = obj["address"] as? String {
+        Pairer.shared.begin(address: addr)
+      }
+    } else if request.hasPrefix("POST /unpair") {
+      if let obj = jsonBody(request), let addr = obj["address"] as? String {
+        _ = Unpairer.unpair(addr)
+        if normalizeAddress(addr) == s.deviceAddress {
+          s.deviceAddress = nil
+          s.save()
+        }
+      }
+    } else if request.hasPrefix("POST /device") {
+      if let obj = jsonBody(request), let addr = obj["address"] as? String {
+        s.deviceAddress = normalizeAddress(addr)
+        s.save()
+        log("device address set to \(s.deviceAddress ?? "?") by UI")
       }
     }
 
+    let foundJSON = s.found
+      .map { "{\"address\":\"\($0.address)\",\"name\":\"\($0.name.replacingOccurrences(of: "\"", with: ""))\"}" }
+      .joined(separator: ",")
+    let code = s.pairingCode.map { "\"\($0)\"" } ?? "null"
+    let err = s.pairingError.map { "\"\($0.replacingOccurrences(of: "\"", with: ""))\"" } ?? "null"
+    let dev = s.deviceAddress.map { "\"\($0)\"" } ?? "null"
+
     return """
-    {"preference":"\(s.preference.rawValue)","transport":"\(s.activeTransport)","linkUp":\(s.linkUp)}
+    {"preference":"\(s.preference.rawValue)","transport":"\(s.activeTransport)","linkUp":\(s.linkUp),\
+    "deviceAddress":\(dev),"paired":\(s.paired),\
+    "pairing":{"stage":"\(s.pairingStage.rawValue)","code":\(code),"error":\(err)},\
+    "found":[\(foundJSON)]}
     """
   }
 }
@@ -336,6 +610,7 @@ control.start()
 // main queue — including the Bluetooth permission check. Blocking the main thread
 // while that happens deadlocks the process and suppresses the permission prompt,
 // so the radio work runs on its own thread and main is left to service the queue.
+// Discovery and pairing callbacks also arrive on the main run loop.
 Thread.detachNewThread {
   runBridgeLoop()
 }
@@ -343,39 +618,52 @@ Thread.detachNewThread {
 RunLoop.main.run()
 
 func runBridgeLoop() -> Never {
-  guard let device = IOBluetoothDevice(addressString: deviceAddr) else {
-    log("bad device address"); exit(1)
-  }
-  log("bluetooth ready for \(device.addressString ?? deviceAddr)")
+  log("bluetooth bridge loop up")
 
   while true {
-  if State.shared.preference == .usb {
-    // User pinned the cable. Keep the reverse in place and stay off the radio.
-    if State.shared.linkUp { State.shared.linkUp = false }
-    fallBackToUSB()
-    Thread.sleep(forTimeInterval: 5)
-    continue
-  }
-
-  let bridge = Bridge()
-  var channel: IOBluetoothRFCOMMChannel?
-  log("connecting to Car Thing rfcomm ch\(rfcommChannelID)...")
-  let res = device.openRFCOMMChannelSync(&channel, withChannelID: rfcommChannelID, delegate: bridge)
-  if res == kIOReturnSuccess {
-    log("connected")
-    while !bridge.isClosed() && State.shared.preference == .bluetooth {
-      RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+    if State.shared.preference == .usb {
+      // User pinned the cable. Keep the reverse in place and stay off the radio.
+      if State.shared.linkUp { State.shared.linkUp = false }
+      fallBackToUSB()
+      Thread.sleep(forTimeInterval: 5)
+      continue
     }
-    log("session ended")
-    channel?.close()
-    device.closeConnection()
-    State.shared.linkUp = false
-  } else {
-    log("connect failed (\(res)); device off/out of range? retrying in 10s")
-    State.shared.linkUp = false
-    // No Bluetooth link, so make sure the USB path is available if the cable is in.
-    fallBackToUSB()
-  }
+
+    // Stay off the radio while a pairing exchange is running — a page from us
+    // mid-pairing can abort it.
+    switch State.shared.pairingStage {
+    case .discovering, .connecting, .confirm, .finishing:
+      Thread.sleep(forTimeInterval: 1)
+      continue
+    default: break
+    }
+
+    guard let addr = State.shared.deviceAddress,
+          let device = IOBluetoothDevice(addressString: addr) else {
+      // Nothing paired yet; wait for the UI to run the pairing flow.
+      Thread.sleep(forTimeInterval: 3)
+      continue
+    }
+
+    let bridge = Bridge()
+    var channel: IOBluetoothRFCOMMChannel?
+    log("connecting to \(addr) rfcomm ch\(rfcommChannelID)...")
+    let res = device.openRFCOMMChannelSync(&channel, withChannelID: rfcommChannelID, delegate: bridge)
+    if res == kIOReturnSuccess {
+      log("connected")
+      while !bridge.isClosed() && State.shared.preference == .bluetooth {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+      }
+      log("session ended")
+      channel?.close()
+      device.closeConnection()
+      State.shared.linkUp = false
+    } else {
+      log("connect failed (\(res)); device off/out of range? retrying in 10s")
+      State.shared.linkUp = false
+      // No Bluetooth link, so make sure the USB path is available if the cable is in.
+      fallBackToUSB()
+    }
     Thread.sleep(forTimeInterval: 10)
   }
 }

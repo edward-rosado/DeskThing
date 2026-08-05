@@ -20,10 +20,17 @@ const resourceRoot = isDevelopment
   ? path.join(__dirname, '..', '..', '..', '..', 'bt_source')
   : process.resourcesPath
 
-export const bridgeBinaryPath = path.join(resourceRoot, getPlatform(), 'btbridge')
+export const bridgeBinaryPath = path.join(
+  resourceRoot,
+  getPlatform(),
+  process.platform === 'win32' ? 'btbridge.exe' : 'btbridge'
+)
 
 /** Where the device-side mux ships, for provisioning a Car Thing over adb. */
 export const deviceMuxScriptPath = path.join(resourceRoot, 'superbird', 'btmux.py')
+
+/** Device-side pairing agent, installed next to the mux during provisioning. */
+export const deviceAgentScriptPath = path.join(resourceRoot, 'superbird', 'btagent.py')
 
 const RESTART_DELAY_MS = 5000
 

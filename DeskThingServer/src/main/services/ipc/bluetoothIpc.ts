@@ -15,5 +15,13 @@ export const bluetoothHandler = async (
       return await bluetoothManager.setPreference(data.payload)
     case IPC_BLUETOOTH_TYPES.PROVISION_DEVICE:
       return await bluetoothManager.provision(data.payload.adbId)
+    case IPC_BLUETOOTH_TYPES.DISCOVER:
+      return await bluetoothManager.discover()
+    case IPC_BLUETOOTH_TYPES.PAIR:
+      return await bluetoothManager.pair(data.payload.address)
+    case IPC_BLUETOOTH_TYPES.PAIR_REPLY:
+      return await bluetoothManager.pairReply(data.payload.accept)
+    case IPC_BLUETOOTH_TYPES.UNPAIR:
+      return await bluetoothManager.unpair(data.payload.address)
   }
 }

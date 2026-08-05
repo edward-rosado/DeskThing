@@ -1,56 +1,44 @@
-import { execFile } from 'child_process'
-import { promisify } from 'util'
 import { handleAdbCommands } from '@server/handlers/adbHandler'
 import Logger from '@server/utils/logger'
 import { LOGGING_LEVELS } from '@deskthing/types'
 import { BluetoothProvisionResult, BluetoothProvisionStep } from '@shared/types'
-import { deviceMuxScriptPath } from './bridgeProcess'
+import { deviceAgentScriptPath, deviceMuxScriptPath } from './bridgeProcess'
 
 /**
  * One-time device provisioning for the Bluetooth transport.
  *
  * Runs over adb while the Car Thing is on USB, and leaves the device able to
- * reach the server over Bluetooth on every subsequent boot: the mux service is
- * installed under supervisord, bluetoothd gains the compat flag it needs to
- * advertise a serial port, and the device is paired with this computer.
+ * reach the server over Bluetooth on every subsequent boot: the mux and the
+ * pairing agent are installed under supervisord, and bluetoothd gains the
+ * compat flag it needs to advertise a serial port.
+ *
+ * Pairing itself is not done here — it is computer-initiated from the setup
+ * wizard (the device screen shows the code, the person confirms here), which
+ * is the same flow the Car Thing shipped with. Provisioning ends by reporting
+ * the device's radio address so the wizard knows who to pair with.
  *
  * Every step is recorded so the UI can show exactly what happened; a failed
  * step stops the sequence.
  */
 
-const execFileAsync = promisify(execFile)
-
 /** RFCOMM channel the device listens on; must match the helper and the mux. */
 const RFCOMM_CHANNEL = 3
 
 const MUX_REMOTE_PATH = '/etc/deskthing-bt/btmux.py'
+const AGENT_REMOTE_PATH = '/etc/deskthing-bt/btagent.py'
 
-const SUPERVISOR_CONF =
-  '[program:btmux]\\n' +
-  'command=/usr/bin/python3 /etc/deskthing-bt/btmux.py 8891\\n' +
+const supervisorConf = (name: string, command: string): string =>
+  `[program:${name}]\\n` +
+  `command=${command}\\n` +
   'autostart=true\\n' +
   'autorestart=true\\n' +
   'startretries=999\\n' +
   'stopasgroup=true\\n' +
   'killasgroup=true\\n' +
   'redirect_stderr=true\\n' +
-  'stdout_logfile=/var/log/btmux.log\\n' +
+  `stdout_logfile=/var/log/${name}.log\\n` +
   'stdout_logfile_maxbytes=512KB\\n' +
   'stdout_logfile_backups=1\\n'
-
-/** The Bluetooth address of this computer's adapter, or null if unknown. */
-export const getHostBluetoothAddress = async (): Promise<string | null> => {
-  if (process.platform !== 'darwin') return null
-  try {
-    const { stdout } = await execFileAsync('system_profiler', ['SPBluetoothDataType', '-json'])
-    const data = JSON.parse(stdout)
-    const address: unknown =
-      data?.SPBluetoothDataType?.[0]?.controller_properties?.controller_address
-    return typeof address === 'string' ? address.toUpperCase() : null
-  } catch {
-    return null
-  }
-}
 
 type StepRunner = () => Promise<string>
 
@@ -75,7 +63,7 @@ const runSteps = async (
 export const provisionDevice = async (adbId: string): Promise<BluetoothProvisionResult> => {
   const adb = (args: string): Promise<string> => handleAdbCommands(`-s ${adbId} ${args}`)
 
-  const hostAddress = await getHostBluetoothAddress()
+  let deviceAddress: string | null = null
 
   const steps: Array<{ id: string; label: string; run: StepRunner }> = [
     {
@@ -85,18 +73,24 @@ export const provisionDevice = async (adbId: string): Promise<BluetoothProvision
     },
     {
       id: 'push-mux',
-      label: 'Install Bluetooth service on device',
+      label: 'Install Bluetooth services on device',
       run: async () => {
         await adb('shell mkdir -p /etc/deskthing-bt')
-        return adb(`push "${deviceMuxScriptPath}" ${MUX_REMOTE_PATH}`)
+        await adb(`push "${deviceMuxScriptPath}" ${MUX_REMOTE_PATH}`)
+        return adb(`push "${deviceAgentScriptPath}" ${AGENT_REMOTE_PATH}`)
       }
     },
     {
       id: 'supervisor',
-      label: 'Register service to start at boot',
+      label: 'Register services to start at boot',
       run: async () => {
         await adb('shell mkdir -p /etc/supervisor.d')
-        return adb(`shell "printf '${SUPERVISOR_CONF}' > /etc/supervisor.d/btmux.conf"`)
+        await adb(
+          `shell "printf '${supervisorConf('btmux', `/usr/bin/python3 ${MUX_REMOTE_PATH} 8891`)}' > /etc/supervisor.d/btmux.conf"`
+        )
+        return adb(
+          `shell "printf '${supervisorConf('btagent', `/usr/bin/python3 ${AGENT_REMOTE_PATH}`)}' > /etc/supervisor.d/btagent.conf"`
+        )
       }
     },
     {
@@ -120,38 +114,17 @@ export const provisionDevice = async (adbId: string): Promise<BluetoothProvision
       }
     },
     {
-      id: 'start-mux',
-      label: 'Start the Bluetooth service',
+      id: 'start-services',
+      label: 'Start the Bluetooth services',
       run: async () => {
         await adb('shell supervisorctl reread')
         await adb('shell supervisorctl update')
         await adb('shell "supervisorctl restart btmux || supervisorctl start btmux"')
-        const status = await adb('shell supervisorctl status btmux')
-        if (!status.includes('RUNNING')) throw new Error(`service not running: ${status.trim()}`)
+        await adb('shell "supervisorctl restart btagent || supervisorctl start btagent"')
+        const status = await adb('shell "supervisorctl status btmux btagent"')
+        const running = (status.match(/RUNNING/g) || []).length
+        if (running < 2) throw new Error(`services not running: ${status.trim()}`)
         return status.trim()
-      }
-    },
-    {
-      id: 'pair',
-      label: 'Pair device with this computer',
-      run: async () => {
-        if (!hostAddress) {
-          // Without the host adapter address the device can't initiate pairing;
-          // the user can still pair manually from the OS Bluetooth settings.
-          return 'skipped — host Bluetooth address unavailable on this platform'
-        }
-        const paired = await adb(`shell bluetoothctl info ${hostAddress}`)
-        if (paired.includes('Paired: yes')) return 'already paired'
-        // Device-initiated pairing with numeric confirmation; the OS shows a
-        // dialog on this computer that the user confirms. macOS rejects
-        // just-works pairing, so DisplayYesNo with an auto-yes is required.
-        const out = await adb(
-          `shell "(printf 'power on\\nagent DisplayYesNo\\ndefault-agent\\npairable on\\npair ${hostAddress}\\n'; sleep 4; printf 'yes\\n'; sleep 12; printf 'trust ${hostAddress}\\nquit\\n'; sleep 1) | bluetoothctl"`
-        )
-        if (!out.includes('Pairing successful') && !out.includes('AlreadyExists')) {
-          throw new Error('pairing did not complete — accept the prompt on this computer and retry')
-        }
-        return 'paired and trusted'
       }
     },
     {
@@ -164,10 +137,22 @@ export const provisionDevice = async (adbId: string): Promise<BluetoothProvision
         if (!records.includes('Serial Port')) throw new Error('serial port not advertised')
         return `serial port on channel ${RFCOMM_CHANNEL}, radio connectable`
       }
+    },
+    {
+      id: 'read-address',
+      label: 'Read device Bluetooth address',
+      run: async () => {
+        const out = await adb('shell hciconfig hci0')
+        const match = out.match(/BD Address:\s*((?:[0-9A-F]{2}:){5}[0-9A-F]{2})/i)
+        if (!match) throw new Error('could not read radio address')
+        deviceAddress = match[1].toUpperCase()
+        return deviceAddress
+      }
     }
   ]
 
   const result = await runSteps(steps)
+  if (result.success && deviceAddress) result.deviceAddress = deviceAddress
   Logger.log(
     result.success ? LOGGING_LEVELS.LOG : LOGGING_LEVELS.WARN,
     `[btProvision] ${adbId}: ${result.success ? 'complete' : 'failed'} (${result.steps.length} steps)`

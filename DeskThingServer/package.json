@@ -20,7 +20,8 @@
     "build:btbridge": "node bt_source/build-btbridge.js",
     "postinstall": "electron-builder install-app-deps && electron-rebuild && npm rebuild sharp",
     "build:unpack": "npm run build && electron-builder --dir",
-    "test": "vitest"
+    "test": "vitest",
+    "test:bt": "vitest run test/main/services/bluetooth && python3 -m unittest discover -s bt_source/test -v"
   },
   "repository": {
     "type": "git",
@@ -133,6 +134,17 @@
         {
           "from": "adb_source/win",
           "to": "resources/win"
+        },
+        {
+          "from": "bt_source/win",
+          "to": "resources/win",
+          "filter": [
+            "btbridge.exe"
+          ]
+        },
+        {
+          "from": "bt_source/superbird",
+          "to": "resources/superbird"
         }
       ]
     },
@@ -188,6 +200,14 @@
         {
           "from": "adb_source/linux",
           "to": "resources/linux"
+        },
+        {
+          "from": "bt_source/linux",
+          "to": "resources/linux"
+        },
+        {
+          "from": "bt_source/superbird",
+          "to": "resources/superbird"
         }
       ]
     },
