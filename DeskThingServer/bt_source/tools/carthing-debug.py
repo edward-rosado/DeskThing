@@ -315,6 +315,66 @@ def cmd_reload(args, port, transport):
         cdp.close()
 
 
+def cmd_timeline(args, port, transport):
+    """Capture frames back-to-back and report when the screen actually changed.
+
+    Use this to measure how long the device takes to show something — a track
+    change, a reconnect, a fresh build. Capture is not free (a frame crosses
+    the same link as everything else), so the cadence is measured and printed
+    rather than assumed; treat it as the resolution of the measurement.
+    """
+    import hashlib
+
+    os.makedirs(args.out, exist_ok=True)
+    cdp, _ = open_page(port)
+    frames = []
+    started = time.time()
+    try:
+        while time.time() - started < args.seconds:
+            t0 = time.time()
+            msg_id = cdp.send('Page.captureScreenshot',
+                              {'format': 'jpeg', 'quality': args.quality})
+            result = cdp.await_result(msg_id)
+            blob = base64.b64decode(result['data'])
+            elapsed = time.time() - started
+            digest = hashlib.sha256(blob).hexdigest()[:12]
+            changed = bool(frames) and digest != frames[-1]['digest']
+            path = os.path.join(args.out, 'frame-%03d.jpg' % len(frames))
+            with open(path, 'wb') as f:
+                f.write(blob)
+            frames.append({'t': elapsed, 'digest': digest, 'changed': changed,
+                           'path': path, 'capture': time.time() - t0})
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cdp.close()
+
+    if not frames:
+        sys.exit('captured nothing')
+
+    cadence = sum(f['capture'] for f in frames) / len(frames)
+    print('%d frames over %s in %.1fs — one frame every %.2fs (that is the '
+          'resolution of this measurement)'
+          % (len(frames), transport, frames[-1]['t'], cadence))
+    print()
+    print('  %-8s %-9s %s' % ('at', 'changed', 'file'))
+    for f in frames:
+        print('  %-8s %-9s %s'
+              % ('%.2fs' % f['t'], 'CHANGED' if f['changed'] else '-',
+                 os.path.basename(f['path'])))
+    changes = [f['t'] for f in frames if f['changed']]
+    print()
+    if changes:
+        print('screen changed at: %s' % ', '.join('%.2fs' % c for c in changes))
+        if len(changes) > 1:
+            gaps = [b - a for a, b in zip(changes, changes[1:])]
+            print('gaps between changes: %s'
+                  % ', '.join('%.2fs' % g for g in gaps))
+    else:
+        print('screen never changed during the capture')
+    print('frames in %s' % args.out)
+
+
 def cmd_console(args, port, transport):
     cdp, _ = open_page(port)
     try:
@@ -368,11 +428,19 @@ def main():
 
     sub.add_parser('console', help='stream console output until Ctrl-C')
 
+    p = sub.add_parser('timeline',
+                       help='capture frames and report when the screen changed')
+    p.add_argument('--seconds', type=float, default=20)
+    p.add_argument('--out', default='/tmp/carthing-timeline')
+    p.add_argument('--quality', type=int, default=40,
+                   help='jpeg quality; lower captures faster (default 40)')
+
     args = parser.parse_args()
     port, transport = resolve_port(args.transport)
     handler = {
         'info': cmd_info, 'shot': cmd_shot, 'eval': cmd_eval,
         'navigate': cmd_navigate, 'reload': cmd_reload, 'console': cmd_console,
+        'timeline': cmd_timeline,
     }[args.command]
     handler(args, port, transport)
 
