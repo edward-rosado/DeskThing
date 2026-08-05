@@ -32,6 +32,13 @@ export const deviceMuxScriptPath = path.join(resourceRoot, 'superbird', 'btmux.p
 /** Device-side pairing agent, installed next to the mux during provisioning. */
 export const deviceAgentScriptPath = path.join(resourceRoot, 'superbird', 'btagent.py')
 
+/** Configures the device browser to use the internet-sharing on-ramp. */
+export const deviceBrowserProxyScriptPath = path.join(
+  resourceRoot,
+  'superbird',
+  'setup-browser-proxy.sh'
+)
+
 const RESTART_DELAY_MS = 5000
 
 let child: ChildProcess | undefined

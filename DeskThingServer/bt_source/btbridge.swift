@@ -39,6 +39,38 @@ let capTargeted: UInt16 = 1 << 1
 let ourCaps: UInt16 = capInbound | capTargeted
 
 let kindService: UInt8 = 0x01
+let kindHostPort: UInt8 = 0x02
+
+/// Destination ports the device may reach on the internet. Anything else is
+/// refused — this is a gateway, not a general port forwarder.
+let inetAllowedPorts: Set<UInt16> = [80, 443]
+
+/// Refuse anything that would let the device reach this computer or the LAN
+/// rather than the internet. Checked on the *resolved* address, so a hostname
+/// that points into a private range is still refused.
+func inetAddressAllowed(_ ip: String) -> Bool {
+  // IPv4 dotted quad, plus the obvious IPv6 cases.
+  let parts = ip.split(separator: ".").compactMap { UInt8($0) }
+  if parts.count == 4 {
+    switch (parts[0], parts[1]) {
+    case (127, _), (10, _), (0, _), (169, 254):
+      return false                                  // loopback, private, link-local
+    case (172, let b) where b >= 16 && b <= 31:
+      return false
+    case (192, 168):
+      return false
+    case (let a, _) where a >= 224:
+      return false                                  // multicast / reserved
+    default:
+      return true
+    }
+  }
+  let lower = ip.lowercased()
+  if lower == "::1" || lower.hasPrefix("fe80:") || lower.hasPrefix("fc") || lower.hasPrefix("fd") {
+    return false
+  }
+  return !lower.isEmpty
+}
 
 enum AckCode: UInt8 {
   case ok = 0, refused = 1, unreachable = 2, unknownService = 3, badNamespace = 4
@@ -129,6 +161,11 @@ final class State {
   private var _pairingError: String? = nil
   private var _found: [FoundDevice] = []
   private weak var _bridge: Bridge?
+  /// Internet sharing. Deliberately NOT persisted and off by default: it points
+  /// the device's browser at the outside world through this machine, so it
+  /// should be a decision someone makes for a session, not a setting that
+  /// quietly survives an upgrade.
+  private var _inetEnabled = false
 
   var preference: Preference {
     get { q.sync { _preference } }
@@ -162,6 +199,10 @@ final class State {
   var bridge: Bridge? {
     get { q.sync { _bridge } }
     set { q.sync { _bridge = newValue } }
+  }
+  var inetEnabled: Bool {
+    get { q.sync { _inetEnabled } }
+    set { q.sync { _inetEnabled = newValue } }
   }
 
   /// The transport actually carrying data right now. Falling back to USB only
@@ -608,6 +649,13 @@ final class ControlServer {
         return "{\"ok\":true,\"service\":\"\(name)\",\"port\":\(port)}"
       }
       return "{\"ok\":false,\"error\":\"missing service\"}"
+    } else if request.hasPrefix("POST /inet") {
+      // Internet sharing on/off. Off is the safe state and the default; it also
+      // resets whenever the link drops.
+      if let obj = jsonBody(request), let on = obj["enabled"] as? Bool {
+        s.inetEnabled = on
+        log("inet: internet sharing \(on ? "ENABLED" : "disabled") by UI")
+      }
     } else if request.hasPrefix("POST /forward/close") {
       if let obj = jsonBody(request), let name = obj["service"] as? String {
         ServiceForwarder.shared.close(name)
@@ -640,7 +688,8 @@ final class ControlServer {
     "pairing":{"stage":"\(s.pairingStage.rawValue)","code":\(code),"error":\(err)},\
     "found":[\(foundJSON)],\
     "protocol":{"version":\(protocolVersion),"inbound":\(inbound)},\
-    "services":[\(servicesJSON)],"forwards":[\(forwardsJSON)]}
+    "services":[\(servicesJSON)],"forwards":[\(forwardsJSON)],\
+    "inet":{"enabled":\(s.inetEnabled),"ports":[80,443]}}
     """
   }
 }
@@ -723,6 +772,8 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     // listeners so nothing accepts a connection it cannot serve.
     ServiceForwarder.shared.closeAll()
     State.shared.bridge = nil
+    // Internet sharing is session-scoped: a new link must be opted into again.
+    State.shared.inetEnabled = false
     State.shared.linkUp = false
     fallBackToUSB()
     q.sync {
@@ -750,7 +801,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
       let payload = rxBuf.subdata(in: rxBuf.startIndex+7..<rxBuf.startIndex+7+ln)
       rxBuf.removeFirst(7 + ln)
       switch t {
-      case 1: openStream(sid)
+      case 1: openStream(sid, payload)
       case 2: conns[sid]?.send(content: payload, completion: .contentProcessed { _ in })
       case 3:
         conns[sid]?.cancel()
@@ -841,9 +892,50 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
   }
 
   // Runs on q.
-  private func openStream(_ sid: UInt32) {
-    // The device only ever opens streams to the DeskThing server, so its OPEN
-    // carries no descriptor and we keep v1 behavior here.
+  private func openStream(_ sid: UInt32, _ payload: Data) {
+    // An empty descriptor keeps its v1 meaning: the DeskThing server.
+    var host = targetHost
+    var port = targetPort
+
+    if !payload.isEmpty {
+      let bytes = [UInt8](payload)
+      guard bytes[0] == kindHostPort, bytes.count >= 2 else {
+        // The device may only ask for the server or the internet; named
+        // services on this computer are not exposed.
+        sendFrame(7, sid, Data([AckCode.refused.rawValue]))
+        return
+      }
+      let hostLen = Int(bytes[1])
+      guard hostLen > 0, bytes.count == 2 + hostLen + 2 else {
+        sendFrame(7, sid, Data([AckCode.unknownService.rawValue]))
+        return
+      }
+      guard let name = String(bytes: bytes[2..<(2 + hostLen)], encoding: .utf8) else {
+        sendFrame(7, sid, Data([AckCode.unknownService.rawValue]))
+        return
+      }
+      let rawPort = (UInt16(bytes[2 + hostLen]) << 8) | UInt16(bytes[3 + hostLen])
+
+      guard State.shared.inetEnabled else {
+        log("inet: refused \(name):\(rawPort) — internet sharing is off")
+        sendFrame(7, sid, Data([AckCode.refused.rawValue]))
+        return
+      }
+      guard inetAllowedPorts.contains(rawPort) else {
+        log("inet: refused \(name):\(rawPort) — port not allowed")
+        sendFrame(7, sid, Data([AckCode.refused.rawValue]))
+        return
+      }
+      host = NWEndpoint.Host(name)
+      guard let p = NWEndpoint.Port(rawValue: rawPort) else {
+        sendFrame(7, sid, Data([AckCode.unknownService.rawValue]))
+        return
+      }
+      port = p
+      openInetStream(sid, host: host, port: port, name: name)
+      return
+    }
+
     let conn = NWConnection(host: targetHost, port: targetPort, using: .tcp)
     conns[sid] = conn
     conn.stateUpdateHandler = { [weak self] state in
@@ -856,6 +948,59 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         }
       case .ready:
         self?.receiveLoop(sid, conn)
+      default: break
+      }
+    }
+    conn.start(queue: q)
+  }
+
+  /// Dial an internet host on the device's behalf. The address policy is
+  /// re-checked once the name resolves, so a hostname pointing into a private
+  /// range is refused just like a literal one would be.
+  // Runs on q.
+  private func openInetStream(_ sid: UInt32, host: NWEndpoint.Host,
+                              port: NWEndpoint.Port, name: String) {
+    let conn = NWConnection(host: host, port: port, using: .tcp)
+    conns[sid] = conn
+    var acked = false
+    conn.stateUpdateHandler = { [weak self] state in
+      guard let self = self else { return }
+      switch state {
+      case .ready:
+        // NWConnection resolved and connected; verify where it actually landed.
+        var remote = ""
+        if case let .hostPort(h, _)? = conn.currentPath?.remoteEndpoint {
+          switch h {
+          case .ipv4(let a): remote = "\(a)"
+          case .ipv6(let a): remote = "\(a)"
+          case .name(let n, _): remote = n
+          @unknown default: remote = ""
+          }
+        }
+        if !remote.isEmpty && !inetAddressAllowed(remote) {
+          log("inet: refused \(name) — resolved into a blocked range (\(remote))")
+          self.q.async {
+            self.conns.removeValue(forKey: sid)?.cancel()
+            self.sendFrame(7, sid, Data([AckCode.refused.rawValue]))
+          }
+          return
+        }
+        if !acked {
+          acked = true
+          self.q.async { self.sendFrame(7, sid, Data([AckCode.ok.rawValue])) }
+        }
+        log("inet: \(name):\(port.rawValue) -> \(remote.isEmpty ? "connected" : remote)")
+        self.receiveLoop(sid, conn)
+      case .failed, .cancelled:
+        self.q.async {
+          if self.conns.removeValue(forKey: sid) != nil {
+            if !acked {
+              acked = true
+              self.sendFrame(7, sid, Data([AckCode.unreachable.rawValue]))
+            }
+            self.sendFrame(3, sid, Data())
+          }
+        }
       default: break
       }
     }

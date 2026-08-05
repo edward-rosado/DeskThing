@@ -144,6 +144,47 @@ payloads, not the protocol.
 The main process (`src/main/services/bluetooth/`) consumes this API and exposes
 it to the renderer over typed IPC; nothing else should call it directly.
 
+## Internet sharing
+
+The device has no route to the internet of its own. With sharing switched on,
+the computer becomes its exit node:
+
+```
+chromium --proxy-server=socks5://127.0.0.1:1080
+   │
+   ▼  SOCKS5 CONNECT
+btmux.py  ──►  OPEN kind 0x02 (host:port)  ──►  helper  ──►  the internet
+```
+
+The device speaks SOCKS5 but resolves nothing — hostnames ride the tunnel
+verbatim and the **computer** resolves them, because the device has no
+resolver. Chromium always does proxy-side DNS for `socks5://`, so this needs no
+DNS server anywhere. (Do not write `socks5h://` in a Chromium flag; that is a
+curl-ism Chromium's URI parser rejects.)
+
+**The computer is the policy point**, since the device is now pointing a socket
+at whatever it likes:
+
+- off by default, per-session, and reset whenever the link drops — it is not a
+  persisted setting
+- ports 80/443 only
+- loopback, private, link-local and cloud-metadata ranges refused, re-checked on
+  the *resolved* address so a hostname pointing into a private range is refused
+  too
+
+Toggle with `POST /inet {"enabled":true}`.
+
+The browser side is configured once by `superbird/setup-browser-proxy.sh`
+(run by the provisioner, and reversible with `disable`). Its bypass list is not
+optional: this browser is Chromium 69, which predates Chrome 72's implicit
+localhost bypass, so without it the client's own `http://localhost:8891`
+traffic would be proxied and the `/__bt` transport probe would stop being
+answered locally.
+
+> **Video does not play on this device** — the browser reports codec support it
+> does not have. See [`docs/device-debugging.md`](../../docs/device-debugging.md).
+> Internet sharing is for reaching the network, not for media.
+
 ## Transport priority
 
 While the RFCOMM link is up, the helper removes the `adb reverse tcp:8891`
