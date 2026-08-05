@@ -12,7 +12,7 @@ import { nextTick } from 'node:process'
 import { updateLoadingStatus } from '@server/windows/loadingWindow'
 import { join } from 'node:path'
 import { checkFlag } from './lifecycleCheck'
-import { startBluetoothBridge, stopBluetoothBridge } from '../services/bluetooth/btBridgeService'
+import { bluetoothManager } from '../services/bluetooth'
 
 /**
  * Initialize the application lifecycle
@@ -63,7 +63,7 @@ export async function initializeAppLifecycle(): Promise<void> {
 
   // Bring up the Bluetooth transport alongside the server so a Car Thing can
   // connect without a data cable. No-ops on platforms without a helper.
-  startBluetoothBridge()
+  bluetoothManager.start()
 
   setTimeout(async () => {
     try {
@@ -77,7 +77,7 @@ export async function initializeAppLifecycle(): Promise<void> {
 
   app.on('before-quit', async () => {
     console.log('Quitting app')
-    stopBluetoothBridge()
+    bluetoothManager.stop()
     const { storeProvider } = await import('../stores/storeProvider')
     const statsCollector = await storeProvider.getStore('statsCollector')
     await statsCollector.collectSessionCloseStats()

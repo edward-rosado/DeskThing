@@ -1,52 +1,39 @@
 import { FC, useCallback, useEffect, useState } from 'react'
+import { BluetoothBridgeStatus, BluetoothPreference, BluetoothTransport } from '@shared/types'
 
 /**
  * Shows which transport is actually carrying data to the Car Thing, and lets the
  * user pin a preference.
  *
- * The data comes from the Bluetooth bridge's local control API rather than from
- * the server, because the bridge is the component that owns the RFCOMM link and
- * arbitrates the USB `adb reverse`. If that bridge isn't running, this section
- * hides itself so a plain USB setup looks no different than before.
+ * Status comes from the main process over IPC; the bluetooth service there owns
+ * the bridge helper, the RFCOMM link, and the USB `adb reverse` arbitration. If
+ * the platform has no bridge or the helper isn't running, this section hides
+ * itself so a plain USB setup looks no different than before.
  */
 
-const CONTROL_API = 'http://127.0.0.1:8899'
 const POLL_MS = 4000
 
-type Transport = 'bluetooth' | 'usb' | 'none'
-type Preference = 'bluetooth' | 'usb'
-
-type BridgeStatus = {
-  preference: Preference
-  transport: Transport
-  linkUp: boolean
-}
-
-const TRANSPORT_LABEL: Record<Transport, string> = {
+const TRANSPORT_LABEL: Record<BluetoothTransport, string> = {
   bluetooth: 'Bluetooth',
   usb: 'USB Cable',
   none: 'Not Connected'
 }
 
-const TRANSPORT_COLOR: Record<Transport, string> = {
+const TRANSPORT_COLOR: Record<BluetoothTransport, string> = {
   bluetooth: 'text-sky-400',
   usb: 'text-amber-400',
   none: 'text-zinc-500'
 }
 
 export const TransportSelector: FC = () => {
-  const [status, setStatus] = useState<BridgeStatus | null>(null)
-  const [available, setAvailable] = useState(true)
+  const [status, setStatus] = useState<BluetoothBridgeStatus | null>(null)
   const [busy, setBusy] = useState(false)
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
-      const res = await fetch(`${CONTROL_API}/status`, { cache: 'no-store' })
-      if (!res.ok) throw new Error(`status ${res.status}`)
-      setStatus((await res.json()) as BridgeStatus)
-      setAvailable(true)
+      setStatus(await window.electron.bluetooth.getStatus())
     } catch {
-      setAvailable(false)
+      setStatus(null)
     }
   }, [])
 
@@ -56,23 +43,18 @@ export const TransportSelector: FC = () => {
     return () => clearInterval(id)
   }, [refresh])
 
-  const choose = async (preference: Preference): Promise<void> => {
+  const choose = async (preference: BluetoothPreference): Promise<void> => {
     setBusy(true)
     try {
-      const res = await fetch(`${CONTROL_API}/preference`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preference })
-      })
-      if (res.ok) setStatus((await res.json()) as BridgeStatus)
+      setStatus(await window.electron.bluetooth.setPreference(preference))
     } catch {
-      setAvailable(false)
+      setStatus(null)
     } finally {
       setBusy(false)
     }
   }
 
-  if (!available || !status) return null
+  if (!status || !status.supported || !status.running) return null
 
   const active = status.transport
 
@@ -104,7 +86,7 @@ export const TransportSelector: FC = () => {
             )}
           </div>
           <div className="grid grid-cols-2 gap-2">
-            {(['bluetooth', 'usb'] as Preference[]).map((option) => {
+            {(['bluetooth', 'usb'] as BluetoothPreference[]).map((option) => {
               const selected = status.preference === option
               return (
                 <button
