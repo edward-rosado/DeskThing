@@ -11,7 +11,8 @@ vi.mock('@server/handlers/adbHandler', () => ({
 
 vi.mock('../../../../src/main/services/bluetooth/bridgeProcess', () => ({
   deviceMuxScriptPath: '/resources/superbird/btmux.py',
-  deviceAgentScriptPath: '/resources/superbird/btagent.py'
+  deviceAgentScriptPath: '/resources/superbird/btagent.py',
+  deviceBrowserProxyScriptPath: '/resources/superbird/setup-browser-proxy.sh'
 }))
 
 import { provisionDevice } from '../../../../src/main/services/bluetooth/provisioner'
@@ -25,6 +26,7 @@ const cannedAdb = (overrides: Record<string, string | Error> = {}): void => {
         return value
       }
     }
+    if (cmd.includes('setup-browser-proxy.sh')) return 'browser proxy: enabled'
     if (cmd.includes('supervisorctl status')) return 'btmux RUNNING\nbtagent RUNNING'
     if (cmd.includes('hciconfig')) {
       return 'hci0: UP RUNNING PSCAN ISCAN\n\tBD Address: 30:E3:D6:05:78:45'
@@ -53,6 +55,7 @@ describe('provisionDevice', () => {
       'bluetoothd-compat',
       'start-services',
       'verify-radio',
+      'browser-proxy',
       'read-address'
     ])
     expect(result.steps.every((s) => s.ok)).toBe(true)
@@ -75,6 +78,22 @@ describe('provisionDevice', () => {
     const confs = adbMock.mock.calls.map((c) => c[0]).filter((c: string) => c.includes('supervisor.d'))
     expect(confs.some((c: string) => c.includes('btmux.conf'))).toBe(true)
     expect(confs.some((c: string) => c.includes('btagent.conf'))).toBe(true)
+  })
+
+  it('installs and runs the browser proxy configuration', async () => {
+    cannedAdb()
+    await provisionDevice('serial123')
+    const cmds = adbMock.mock.calls.map((c) => c[0] as string)
+    expect(cmds.some((c) => c.includes('push') && c.includes('setup-browser-proxy.sh'))).toBe(true)
+    expect(cmds.some((c) => c.includes('chmod +x'))).toBe(true)
+    expect(cmds.some((c) => /setup-browser-proxy\.sh enable/.test(c))).toBe(true)
+  })
+
+  it('fails browser-proxy when the script does not confirm', async () => {
+    cannedAdb({ 'setup-browser-proxy.sh enable': 'sh: not found' })
+    const result = await provisionDevice('serial123')
+    expect(result.success).toBe(false)
+    expect(result.steps.at(-1)).toMatchObject({ id: 'browser-proxy', ok: false })
   })
 
   it('stops at the first failing step and reports it', async () => {

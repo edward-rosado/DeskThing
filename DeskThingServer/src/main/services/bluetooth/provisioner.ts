@@ -2,7 +2,11 @@ import { handleAdbCommands } from '@server/handlers/adbHandler'
 import Logger from '@server/utils/logger'
 import { LOGGING_LEVELS } from '@deskthing/types'
 import { BluetoothProvisionResult, BluetoothProvisionStep } from '@shared/types'
-import { deviceAgentScriptPath, deviceMuxScriptPath } from './bridgeProcess'
+import {
+  deviceAgentScriptPath,
+  deviceBrowserProxyScriptPath,
+  deviceMuxScriptPath
+} from './bridgeProcess'
 
 /**
  * One-time device provisioning for the Bluetooth transport.
@@ -26,6 +30,7 @@ const RFCOMM_CHANNEL = 3
 
 const MUX_REMOTE_PATH = '/etc/deskthing-bt/btmux.py'
 const AGENT_REMOTE_PATH = '/etc/deskthing-bt/btagent.py'
+const BROWSER_PROXY_REMOTE_PATH = '/etc/deskthing-bt/setup-browser-proxy.sh'
 
 const supervisorConf = (name: string, command: string): string =>
   `[program:${name}]\\n` +
@@ -77,7 +82,9 @@ export const provisionDevice = async (adbId: string): Promise<BluetoothProvision
       run: async () => {
         await adb('shell mkdir -p /etc/deskthing-bt')
         await adb(`push "${deviceMuxScriptPath}" ${MUX_REMOTE_PATH}`)
-        return adb(`push "${deviceAgentScriptPath}" ${AGENT_REMOTE_PATH}`)
+        await adb(`push "${deviceAgentScriptPath}" ${AGENT_REMOTE_PATH}`)
+        await adb(`push "${deviceBrowserProxyScriptPath}" ${BROWSER_PROXY_REMOTE_PATH}`)
+        return adb(`shell chmod +x ${BROWSER_PROXY_REMOTE_PATH}`)
       }
     },
     {
@@ -136,6 +143,20 @@ export const provisionDevice = async (adbId: string): Promise<BluetoothProvision
         const records = await adb('shell sdptool browse local')
         if (!records.includes('Serial Port')) throw new Error('serial port not advertised')
         return `serial port on channel ${RFCOMM_CHANNEL}, radio connectable`
+      }
+    },
+    {
+      id: 'browser-proxy',
+      label: 'Point the device browser at the internet-sharing on-ramp',
+      run: async () => {
+        // Inert until internet sharing is switched on for a session: the
+        // device's SOCKS port only reaches the outside world if the computer
+        // agrees. Doing it here means it never needs a cable again.
+        const out = await adb(`shell sh ${BROWSER_PROXY_REMOTE_PATH} enable`)
+        if (!out.includes('enabled')) {
+          throw new Error(`could not configure the browser: ${out.trim()}`)
+        }
+        return out.trim()
       }
     },
     {

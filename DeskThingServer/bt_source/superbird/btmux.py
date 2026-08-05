@@ -21,6 +21,11 @@ import asyncio, os, socket, struct, subprocess, sys, time
 LISTEN_ADDR = '127.0.0.1'
 LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8891
 RFCOMM_CHANNEL = 3
+# SOCKS5 endpoint for internet sharing. Chromium is pointed here with
+# --proxy-server=socks5://127.0.0.1:1080; each CONNECT becomes a tunneled
+# stream that the computer dials out on our behalf. Name resolution happens
+# on the computer — this device has no resolver at all.
+SOCKS_PORT = 1080
 CHUNK = 660  # frame + 7-byte header stays within the 667-byte RFCOMM MTU
 
 # --- protocol v2 -----------------------------------------------------------
@@ -101,6 +106,9 @@ class Mux:
         self.last_pong = time.time()
         self.peer_version = 1        # assume v1 until a HELLO says otherwise
         self.peer_caps = 0
+        # Streams waiting on an OPEN_ACK, so a SOCKS client can be told whether
+        # its connection actually succeeded before any payload moves.
+        self.pending_ack = {}
 
     async def send(self, t, sid, payload=b''):
         async with self.wlock:
@@ -181,6 +189,98 @@ class Mux:
             except Exception:
                 pass
         asyncio.ensure_future(self.pump_inbound(sid, r, w))
+
+    async def handle_socks(self, r, w):
+        """A SOCKS5 CONNECT from chromium becomes a tunneled host:port stream.
+
+        Only CONNECT is supported, and the name is passed through untouched for
+        the computer to resolve — this device has no DNS. The computer enforces
+        the destination policy; we are just the on-ramp.
+        """
+        sid = None
+        try:
+            greeting = await asyncio.wait_for(r.readexactly(2), timeout=10)
+            if greeting[0] != 5:
+                w.close()
+                return
+            await r.readexactly(greeting[1])          # method list, unused
+            w.write(b'\x05\x00')                      # no authentication
+            await w.drain()
+
+            head = await asyncio.wait_for(r.readexactly(4), timeout=10)
+            _ver, cmd, _rsv, atyp = head
+            if cmd != 1:                              # CONNECT only
+                w.write(b'\x05\x07\x00\x01' + b'\x00' * 6)
+                await w.drain()
+                w.close()
+                return
+
+            if atyp == 1:
+                host = socket.inet_ntoa(await r.readexactly(4))
+            elif atyp == 3:
+                ln = (await r.readexactly(1))[0]
+                host = (await r.readexactly(ln)).decode('ascii', 'replace')
+            elif atyp == 4:
+                host = socket.inet_ntop(socket.AF_INET6, await r.readexactly(16))
+            else:
+                w.write(b'\x05\x08\x00\x01' + b'\x00' * 6)
+                await w.drain()
+                w.close()
+                return
+            port = struct.unpack('>H', await r.readexactly(2))[0]
+
+            if len(host) > 255:
+                w.write(b'\x05\x01\x00\x01' + b'\x00' * 6)
+                await w.drain()
+                w.close()
+                return
+
+            sid = self.next_id
+            self.next_id += 1
+            waiter = asyncio.get_event_loop().create_future()
+            self.pending_ack[sid] = waiter
+            payload = (bytes([KIND_HOSTPORT, len(host)])
+                       + host.encode('ascii') + struct.pack('>H', port))
+            await self.send(1, sid, payload)
+
+            try:
+                code = await asyncio.wait_for(waiter, timeout=20)
+            except asyncio.TimeoutError:
+                code = ACK_UNREACHABLE
+            finally:
+                self.pending_ack.pop(sid, None)
+
+            if code != ACK_OK:
+                # 2 = connection not allowed, 4 = host unreachable
+                rep = 2 if code == ACK_REFUSED else 4
+                w.write(bytes([5, rep, 0, 1]) + b'\x00' * 6)
+                await w.drain()
+                w.close()
+                return
+
+            self.streams[sid] = w
+            w.write(b'\x05\x00\x00\x01' + b'\x00' * 6)   # success
+            await w.drain()
+
+            while True:
+                data = await r.read(CHUNK)
+                if not data:
+                    break
+                await self.send(2, sid, data)
+        except Exception:
+            pass
+        finally:
+            if sid is not None:
+                self.pending_ack.pop(sid, None)
+                if self.streams.pop(sid, None) is not None:
+                    try:
+                        await self.send(3, sid)
+                    except Exception:
+                        pass
+            try:
+                w.close()
+            except Exception:
+                pass
 
     async def pump_inbound(self, sid, r, w):
         """Relay a computer-opened stream from the device service back out."""
@@ -305,9 +405,13 @@ class Mux:
                     asyncio.ensure_future(self.open_inbound(sid, payload))
                     continue
                 if t == 7:  # OPEN_ACK for a stream we opened
-                    if payload and payload[0] != ACK_OK:
+                    code = payload[0] if payload else ACK_OK
+                    waiter = self.pending_ack.get(sid)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(code)      # SOCKS caller is waiting
+                    elif code != ACK_OK:
                         print('mux: peer refused stream %d (code %d)'
-                              % (sid, payload[0]), flush=True)
+                              % (sid, code), flush=True)
                         self.drop(sid)
                     continue
                 if sid in self.opening:
@@ -352,7 +456,7 @@ async def session(conn):
     # Port 8891 may be held by adb reverse while USB is attached. Bind in a
     # concurrent task with retries so the rfcomm pump still notices a dead link
     # while we wait for the port to free up.
-    state = {'server': None}
+    state = {'server': None, 'socks': None}
 
     async def binder():
         while state['server'] is None:
@@ -362,6 +466,18 @@ async def session(conn):
                 print('mux: tunnel up, listening on %s:%d' % (LISTEN_ADDR, LISTEN_PORT), flush=True)
             except OSError:
                 print('mux: port %d busy (USB active?), retrying in 10s' % LISTEN_PORT, flush=True)
+                await asyncio.sleep(10)
+
+    async def socks_binder():
+        # Internet sharing on-ramp. Binding it costs nothing when unused; the
+        # computer refuses every stream unless sharing is switched on there.
+        while state['socks'] is None:
+            try:
+                state['socks'] = await asyncio.start_server(
+                    mux.handle_socks, LISTEN_ADDR, SOCKS_PORT)
+                print('mux: socks5 on %s:%d (internet sharing on-ramp)'
+                      % (LISTEN_ADDR, SOCKS_PORT), flush=True)
+            except OSError:
                 await asyncio.sleep(10)
 
     async def client_watchdog():
@@ -381,6 +497,7 @@ async def session(conn):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     bind_task = asyncio.ensure_future(binder())
+    socks_task = asyncio.ensure_future(socks_binder())
     wd_task = asyncio.ensure_future(client_watchdog())
     hb_task = asyncio.ensure_future(mux.heartbeat())
     pump_task = asyncio.ensure_future(mux.pump_rfcomm())
@@ -400,10 +517,11 @@ async def session(conn):
     except (OSError, ConnectionError) as e:
         print('mux: rfcomm link closed (%s)' % e, flush=True)
     finally:
-        for task in (hb_task, pump_task, bind_task, wd_task):
+        for task in (hb_task, pump_task, bind_task, wd_task, socks_task):
             task.cancel()
-        if state['server'] is not None:
-            state['server'].close()
+        for key in ('server', 'socks'):
+            if state[key] is not None:
+                state[key].close()
         for w in list(mux.streams.values()) + list(mux.inbound.values()):
             try:
                 w.close()
