@@ -8,7 +8,13 @@ import struct
 import unittest
 
 FRAME = '>BIH'  # type(1) streamID(4 BE) len(2 BE)
-OPEN, DATA, CLOSE = 1, 2, 3
+OPEN, DATA, CLOSE, PING, PONG = 1, 2, 3, 4, 5
+
+# The device drops the link after this long without a PONG, and pings this
+# often. Every computer-side helper MUST answer PING or the link cannot
+# survive — this is not optional behavior.
+PING_INTERVAL_S = 5
+PONG_DEADLINE_S = 15
 
 
 class FrameProtocol(unittest.TestCase):
@@ -25,6 +31,18 @@ class FrameProtocol(unittest.TestCase):
     def test_close_frame_golden(self):
         self.assertEqual(
             struct.pack(FRAME, CLOSE, 0xFFFFFFFF, 0), b'\x03\xff\xff\xff\xff\x00\x00')
+
+    def test_ping_frame_golden(self):
+        # Heartbeat frames carry no stream and no payload.
+        self.assertEqual(struct.pack(FRAME, PING, 0, 0), b'\x04\x00\x00\x00\x00\x00\x00')
+
+    def test_pong_frame_golden(self):
+        self.assertEqual(struct.pack(FRAME, PONG, 0, 0), b'\x05\x00\x00\x00\x00\x00\x00')
+
+    def test_heartbeat_deadline_allows_missed_pings(self):
+        # The deadline must span more than one ping so a single dropped frame
+        # doesn't tear down a healthy link.
+        self.assertGreaterEqual(PONG_DEADLINE_S, 3 * PING_INTERVAL_S)
 
     def test_roundtrip(self):
         for t, sid, payload in [

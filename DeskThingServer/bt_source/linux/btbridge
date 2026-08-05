@@ -32,6 +32,12 @@ SERVER_ADDR = ('127.0.0.1', 8891)
 CONTROL_ADDR = ('127.0.0.1', 8899)
 CHUNK = 660  # frame + 7-byte header stays near the typical RFCOMM MTU
 
+# Heartbeat timing. Must stay compatible with the device mux, which pings on
+# the same interval and drops the link after the same deadline; the deadline
+# spans several intervals so one dropped frame doesn't tear down a good link.
+PING_INTERVAL_S = 5
+PONG_DEADLINE_S = 15
+
 STATE_DIR = os.path.join(
     os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), 'deskthing')
 STATE_PATH = os.path.join(STATE_DIR, 'bt-transport.json')
@@ -376,6 +382,7 @@ class Tunnel:
         self.conns = {}
         self.wlock = threading.Lock()
         self.dead = threading.Event()
+        self.last_pong = time.time()
 
     def send_frame(self, t, sid, payload=b''):
         with self.wlock:
@@ -410,10 +417,32 @@ class Tunnel:
                                 self.close_stream(sid, notify=True)
                     elif t == 3:
                         self.close_stream(sid, notify=False)
+                    elif t == 4:  # PING -> answer so the peer knows we live
+                        self.send_frame(5, 0)
+                    elif t == 5:  # PONG
+                        self.last_pong = time.time()
         except OSError:
             pass
         finally:
             self.dead.set()
+
+    def heartbeat(self):
+        """Mirror of the device mux's heartbeat. The device pings every 5s and
+        drops the link after 15s of silence, so answering PING is mandatory —
+        without it the link cannot survive 15 seconds. We also ping outward so
+        a half-open link (reports connected, passes no data) gets torn down
+        here rather than lingering."""
+        self.last_pong = time.time()
+        while not self.dead.wait(PING_INTERVAL_S):
+            self.send_frame(4, 0)
+            if time.time() - self.last_pong > PONG_DEADLINE_S:
+                log('heartbeat: no pong in %ss — link dead, closing' % PONG_DEADLINE_S)
+                self.dead.set()
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
 
     def open_stream(self, sid):
         try:
@@ -494,6 +523,7 @@ def bridge_loop():
         STATE.link_up = True
         prefer_bluetooth()
         tunnel = Tunnel(sock)
+        threading.Thread(target=tunnel.heartbeat, daemon=True).start()
         tunnel.pump_rfcomm()
         tunnel.close()
         log('session ended')
