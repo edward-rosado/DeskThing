@@ -59,18 +59,38 @@ knowing before designing anything that runs on the device:
 | --- | --- |
 | Browser | **Chrome/69.0.3497.128** (QtWebEngine 5.12.x) — a 2018 engine |
 | Viewport | 800×480 |
-| Video | **VP8 in WebM: yes.** VP9: **no**. H.264/MP4: **no** |
-| Audio | Opus: yes. Vorbis: yes. MP3: yes. AAC: no |
+| Images | Load and render normally, including over the network |
+| **Video** | **Does not play. At all.** See below |
 | Page origin | `file:///usr/share/qt-superbird-app/webapp/index.html` |
 
-Two consequences that catch people out:
+### Video does not work on this device — and the browser lies about it
 
-- **Encode video as VP8 + Opus/Vorbis in WebM.** VP9 and H.264 will not play —
-  the device has no proprietary-codec build, and its engine predates VP9
-  support here. Verify with
-  `./carthing-debug.py eval "MediaSource.isTypeSupported('video/webm; codecs=\"vp8,opus\"')"`.
-- **Chrome 69 predates a lot.** The DeskThing client ships a legacy build
-  targeting it for exactly this reason. Modern web apps generally will not run.
+`canPlayType('video/webm; codecs="vp8,vorbis"')` returns **`"probably"`**, and
+`MediaSource.isTypeSupported` agrees. **Both are wrong.** This build of
+QtWebEngine ships the format *tables* but not the decoders, so it advertises
+support it does not have.
+
+Verified on hardware, controlling for every other variable:
+
+- A genuine VP8 + Vorbis WebM fails with `MediaError.code 4`
+  (`SRC_NOT_SUPPORTED`), `networkState 3`, `readyState 0`.
+- It fails **identically** when served from `127.0.0.1` over `adb reverse` —
+  no proxy, no internet, no CORS, no TLS in the path.
+- `curl` on the device downloads that exact file completely (482 KB, HTTP 200),
+  so the bytes are reachable. The failure is decode, not transport.
+- An `<img>` from the same network path loads and renders fine, so page
+  subresource loading works — it is specific to media.
+
+**Do not plan any feature around playing video in the stock browser.** No codec
+choice, bandwidth budget, or transport will fix it. Showing motion on this
+device would mean decoding elsewhere and pushing frames as images, or replacing
+the browser/firmware.
+
+*Trust `<video>` events over `canPlayType` when probing this device.* The static
+table is not evidence.
+
+**Chrome 69 also predates a lot.** The DeskThing client ships a legacy build
+targeting it for exactly this reason; modern web apps generally will not run.
 
 ---
 

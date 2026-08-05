@@ -226,6 +226,19 @@ class CDP:
                 pass
 
 
+def describe_exception(details):
+    """Turn CDP exceptionDetails into something worth reading."""
+    exc = details.get('exception') or {}
+    text = (exc.get('description')
+            or exc.get('value')
+            or details.get('text')
+            or 'unknown error')
+    line = details.get('lineNumber')
+    if line is not None:
+        text = '%s (at line %d)' % (text, line + 1)
+    return text
+
+
 def open_page(port):
     cdp = CDP(port)
     target = cdp.page_target()
@@ -270,6 +283,11 @@ def cmd_eval(args, port, transport):
             'awaitPromise': True,
         })
         result = cdp.await_result(msg_id)
+        # A thrown exception comes back as a *successful* CDP response carrying
+        # exceptionDetails. Reporting only the (undefined) value would print
+        # "null" and hide the error — the tool would lie about what happened.
+        if 'exceptionDetails' in result:
+            sys.exit('JavaScript exception: %s' % describe_exception(result['exceptionDetails']))
         value = result.get('result', {})
         if value.get('type') == 'undefined':
             print('undefined')
