@@ -23,13 +23,16 @@ import { ColorExtractor } from './ColorExtractor'
  */
 export class MusicService implements MusicStoreClass {
   /**
-   * When to ask after playback is expected to have changed. The first attempt
-   * is immediate; the rest cover the provider's own lag in reporting the new
-   * track, which is around a second in practice. Three attempts, then give up
-   * and let the scheduled refresh handle it.
+   * How long to wait for the answer to each attempt when chasing a track
+   * change. Every entry is a request followed by that pause before looking at
+   * the result, so the list is both the retry count and the total window —
+   * about seven seconds, which comfortably covers the provider's own lag in
+   * reporting a skip. The chase stops the moment the track is different, so
+   * the usual cost is the first entry alone.
    */
-  private static readonly TRACK_CHANGE_RETRY_DELAYS_MS = [0, 1200, 2500]
+  private static readonly TRACK_CHANGE_RETRY_DELAYS_MS = [600, 900, 1200, 1800, 2500]
 
+  private chasing = false
   private refreshInterval: NodeJS.Timeout | null = null
   private currentApp: string | null = null
   private songCache: SongCache
@@ -268,33 +271,46 @@ export class MusicService implements MusicStoreClass {
    * multi-hour Retry-After.
    */
   private async chaseTrackChange(): Promise<void> {
-    const leaving = this.songCache.getCurrentSong()
-    const leavingId = leaving?.id
-    const leavingName = leaving?.track_name
+    // One chase at a time. A skip lands while the previous chase may still be
+    // running, and letting them overlap multiplies requests for one answer.
+    if (this.chasing) return
+    this.chasing = true
 
-    for (const delay of MusicService.TRACK_CHANGE_RETRY_DELAYS_MS) {
-      if (delay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay))
+    try {
+      const leaving = this.songCache.getCurrentSong()
+      const leavingId = leaving?.id
+      const leavingName = leaving?.track_name
+      const leavingProgress = leaving?.track_progress
+
+      for (const wait of MusicService.TRACK_CHANGE_RETRY_DELAYS_MS) {
+        await this.refreshMusicData(undefined, { force: true })
+
+        // Wait BEFORE looking. refreshMusicData only hands the request to the
+        // source app; the answer arrives later, over a separate message, and
+        // updates the cache then. Checking immediately after sending always
+        // reads the track we are trying to leave, so every attempt "fails"
+        // and the chase gives up on a change it had in fact already asked
+        // for — which is how a skip fell back to the scheduled poll and took
+        // a full cycle instead of about a second.
+        await new Promise((resolve) => setTimeout(resolve, wait))
+
+        const now = this.songCache.getCurrentSong()
+        if (!now) continue
+
+        // Stop when the track is genuinely different. Repeat-one replays the
+        // same id, so a progress collapse counts as a change too — otherwise
+        // the chase would run to exhaustion on every looped track.
+        const isDifferent = now.id !== leavingId || now.track_name !== leavingName
+        const restarted =
+          leavingProgress != null && now.track_progress != null && now.track_progress < leavingProgress
+
+        if (isDifferent || restarted) return
+
+        // Nothing is playing any more — there is no next track to wait for.
+        if (now.is_playing === false) return
       }
-
-      await this.refreshMusicData(undefined, { force: true })
-
-      const now = this.songCache.getCurrentSong()
-      if (!now) continue
-
-      // Stop when the track is genuinely different. Repeat-one replays the
-      // same id, so a progress collapse counts as a change too — otherwise the
-      // ladder would run to exhaustion on every looped track.
-      const isDifferent = now.id !== leavingId || now.track_name !== leavingName
-      const restarted =
-        leaving?.track_progress != null &&
-        now.track_progress != null &&
-        now.track_progress < leaving.track_progress
-
-      if (isDifferent || restarted) return
-
-      // Nothing is playing any more — there is no next track to wait for.
-      if (now.is_playing === false) return
+    } finally {
+      this.chasing = false
     }
   }
 
