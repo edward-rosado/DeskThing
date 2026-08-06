@@ -26,13 +26,6 @@ export async function setupTray(): Promise<void> {
 
   tray = new Tray(trayIcon)
 
-  if (process.platform === 'darwin') {
-    // Name it in the menubar. A 16px glyph cannot carry a wordmark — the
-    // letters fall below a pixel — so the only way to actually say DeskThing
-    // up there is the menubar item's own title.
-    tray.setTitle('DeskThing')
-  }
-
   // Handle tray icon click
   tray.on('click', () => {
     const mainWindow = getMainWindow()
