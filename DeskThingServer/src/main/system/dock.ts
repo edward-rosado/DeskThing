@@ -3,6 +3,7 @@
  */
 import { app, BrowserWindow, Menu } from 'electron'
 import { getMainWindow, getClientWindow, buildMainWindow } from '../windows/windowManager'
+import { setDockVisible } from './dockVisibility'
 
 /**
  * Initializes the dock menu (macOS only)
@@ -50,9 +51,11 @@ export async function setupDock(): Promise<void> {
       }
     },
     {
-      label: 'Hide Tray Icon',
+      // This hides the Dock icon, not the tray icon. Going through the shared
+      // state keeps this menu and the tray menu telling the same story.
+      label: 'Hide Dock Icon',
       click: (): void => {
-        app.dock.hide()
+        void setDockVisible(false)
       }
     },
     {
