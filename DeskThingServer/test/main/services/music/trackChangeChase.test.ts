@@ -41,7 +41,7 @@ const song = (over: Partial<SongData> = {}): SongData =>
  * ASYNCHRONOUS: a refresh request is acknowledged immediately and the song
  * arrives later on a separate message, exactly as the real app behaves.
  */
-const buildHarness = (answerAfterMs: number) => {
+const buildHarness = (answerAfterMs: number, opts: { refreshInterval?: number; clients?: number } = {}) => {
   let songHandler: ((d: { app: string; payload: SongData }) => Promise<void>) | null = null
   let current = song()
   const requests: unknown[] = []
@@ -67,7 +67,8 @@ const buildHarness = (answerAfterMs: number) => {
     initialize: vi.fn(async () => {}),
     getSettings: vi.fn(async () => ({
       music_playbackLocation: 'spotify',
-      music_refreshInterval: -1 // no scheduled poll; isolate the chase
+      // Default: no scheduled poll, so the chase tests measure the chase alone.
+      music_refreshInterval: opts.refreshInterval ?? -1
     })),
     saveSetting: vi.fn(async () => {}),
     on: vi.fn(() => vi.fn())
@@ -76,7 +77,8 @@ const buildHarness = (answerAfterMs: number) => {
   const platformStore = {
     on: vi.fn(() => vi.fn()),
     broadcastToClients: vi.fn(async () => {}),
-    sendDataToClient: vi.fn(async () => {})
+    sendDataToClient: vi.fn(async () => {}),
+    getClients: vi.fn(() => new Array(opts.clients ?? 0).fill({ clientId: 'c' }))
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -190,6 +192,50 @@ describe('chasing a track change', () => {
     // Two overlapping ladders would roughly double this.
     expect(h.refreshCount()).toBeLessThanOrEqual(2)
   })
+
+  it('polls often while someone is watching something play', async () => {
+    // The only way to notice playback changed in the provider's own app on
+    // another device. At the configured 15s that change took up to 15s to
+    // appear even after the boundary work.
+    const h = buildHarness(50, { refreshInterval: 15000, clients: 1 })
+    await h.seedCurrentSong()
+
+    await settle(5200)
+
+    // ~2s cadence gives at least a couple of looks in 5s; the configured 15s
+    // would give none.
+    expect(h.refreshCount()).toBeGreaterThanOrEqual(2)
+  }, 20000)
+
+  it('falls back to the configured rate when nobody is connected', async () => {
+    // A poll nobody can see is pure rate-limit cost.
+    const h = buildHarness(50, { refreshInterval: 15000, clients: 0 })
+    await h.seedCurrentSong()
+
+    await settle(5200)
+
+    expect(h.refreshCount()).toBe(0)
+  }, 20000)
+
+  it('falls back to the configured rate while playback is paused', async () => {
+    const h = buildHarness(50, { refreshInterval: 15000, clients: 1 })
+    h.advanceToNextTrack(song({ is_playing: false }))
+    await h.seedCurrentSong()
+
+    await settle(5200)
+
+    expect(h.refreshCount()).toBe(0)
+  }, 20000)
+
+  it('never polls faster than the configured rate', async () => {
+    // A user who deliberately set a slow cadence must not be overridden.
+    const h = buildHarness(50, { refreshInterval: 30000, clients: 1 })
+    await h.seedCurrentSong()
+
+    await settle(5200)
+
+    expect(h.refreshCount()).toBeGreaterThanOrEqual(2)
+  }, 20000)
 
   it('lets a later chase replace an earlier one instead of dropping it', async () => {
     // Regression: a plain "already chasing" flag made the second skip a no-op,
