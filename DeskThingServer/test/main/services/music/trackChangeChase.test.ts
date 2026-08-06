@@ -190,4 +190,26 @@ describe('chasing a track change', () => {
     // Two overlapping ladders would roughly double this.
     expect(h.refreshCount()).toBeLessThanOrEqual(2)
   })
+
+  it('lets a later chase replace an earlier one instead of dropping it', async () => {
+    // Regression: a plain "already chasing" flag made the second skip a no-op,
+    // so it fell through to the scheduled poll. Worse, a chase that never
+    // finished left the flag set and disabled every future chase — which is
+    // what stopped the chase running at all on the device.
+    const h = buildHarness(250)
+    await h.seedCurrentSong()
+
+    await skip(h.service)
+    await settle(300) // first chase mid-flight
+    h.platformStore.broadcastToClients.mockClear()
+
+    // A second skip must still produce requests of its own.
+    const before = h.refreshCount()
+    await skip(h.service)
+    h.advanceToNextTrack(song({ track_name: 'Start!', id: 'track-d', track_progress: 0 }))
+    await settle(1200)
+
+    expect(h.refreshCount()).toBeGreaterThan(before)
+    expect(lastBroadcastTrack(h.platformStore)).toBe('Start!')
+  })
 })
