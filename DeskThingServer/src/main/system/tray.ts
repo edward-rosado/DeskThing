@@ -16,6 +16,10 @@ export async function setupTray(): Promise<void> {
 
   if (process.platform === 'darwin') {
     trayIcon = nativeImage.createFromPath(join(__dirname, '../../resources/iconTrayMacSm.png'))
+    // The macOS asset is a template image: black plus alpha, which the system
+    // recolours for the current menubar. Without this flag it is drawn as
+    // literal black and disappears against a dark menubar.
+    trayIcon.setTemplateImage(true)
   } else {
     trayIcon = nativeImage.createFromPath(join(__dirname, '../../resources/iconTray.png'))
   }
