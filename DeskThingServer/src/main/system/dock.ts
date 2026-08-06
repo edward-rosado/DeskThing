@@ -20,7 +20,7 @@ export async function setupDock(): Promise<void> {
       type: 'separator'
     },
     {
-      label: 'Open Desktop',
+      label: 'Open DeskThing',
       click: (): void => {
         const mainWindow = getMainWindow()
 
