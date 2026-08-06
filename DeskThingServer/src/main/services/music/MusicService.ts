@@ -35,7 +35,17 @@ export class MusicService implements MusicStoreClass {
   /** How long to wait for a refresh request to be handed off before moving on. */
   private static readonly REFRESH_SEND_TIMEOUT_MS = 2000
 
+  /**
+   * Poll cadence while a client is connected and something is playing. This is
+   * the only thing that notices playback changed from the provider's own app on
+   * another device, so it bounds how stale the screen can be in that case.
+   * Costs one request per tick and, because the source only reports genuine
+   * state changes, sends nothing to clients unless something actually changed.
+   */
+  private static readonly ACTIVE_REFRESH_INTERVAL_MS = 2000
+
   private chaseGeneration = 0
+  private configuredRefreshRate = -1
   private refreshInterval: NodeJS.Timeout | null = null
   private currentApp: string | null = null
   private songCache: SongCache
@@ -75,27 +85,73 @@ export class MusicService implements MusicStoreClass {
 
   async updateRefreshInterval(refreshRate: number): Promise<void> {
     if (this.refreshInterval) {
-      clearInterval(this.refreshInterval)
+      clearTimeout(this.refreshInterval)
+      this.refreshInterval = null
     }
+
+    this.configuredRefreshRate = refreshRate
 
     if (refreshRate < 0) {
       Logger.log(LOGGING_LEVELS.LOG, `Music refresh disabled`)
       return
     }
 
-    if (refreshRate < 5000) {
-      Logger.log(LOGGING_LEVELS.WARN, `Refresh interval of ${refreshRate}s may impact performance`)
-      if (refreshRate < 1000) {
-        Logger.log(
-          LOGGING_LEVELS.WARN,
-          `Extremely low refresh interval (${refreshRate}s) could cause system issues`
-        )
-      }
+    if (refreshRate < 1000) {
+      Logger.log(
+        LOGGING_LEVELS.WARN,
+        `Extremely low refresh interval (${refreshRate}ms) could cause system issues`
+      )
     }
 
-    this.refreshInterval = setInterval(() => {
-      this.refreshMusicData()
-    }, refreshRate)
+    this.scheduleRefresh()
+  }
+
+  /**
+   * Pick the next poll delay from what is actually happening, and schedule one
+   * poll at a time rather than running a fixed interval.
+   *
+   * A track that ends on its own, and a skip made from a connected client, are
+   * both handled the moment they happen — one is predicted from the track's own
+   * duration, the other is observed as a command. Neither needs the poll.
+   *
+   * What the poll is for is the case with no boundary to predict and no command
+   * to observe: playback changed somewhere else entirely, from the provider's
+   * own app on a phone or desktop. Nothing announces that, so the only way to
+   * notice is to look — and at the configured 15s that meant a change made
+   * elsewhere took up to 15s to appear, which is the whole of the delay users
+   * still saw after the boundary work.
+   *
+   * So look often, but only while it can matter: something is connected to show
+   * it, and something is actually playing. Idle or paused, this falls back to
+   * the configured rate, because a poll that nobody can see is pure cost — and
+   * cost here is provider rate limit, which is not free to spend.
+   */
+  private scheduleRefresh(): void {
+    if (this.refreshInterval) {
+      clearTimeout(this.refreshInterval)
+      this.refreshInterval = null
+    }
+
+    if (this.configuredRefreshRate < 0) return
+
+    const song = this.songCache.getCurrentSong()
+    const someoneIsWatching = this.platformStore.getClients().length > 0
+    const active = someoneIsWatching && song?.is_playing === true
+
+    // Never poll slower than configured, and never faster than the active rate.
+    const delay = active
+      ? Math.min(MusicService.ACTIVE_REFRESH_INTERVAL_MS, this.configuredRefreshRate)
+      : this.configuredRefreshRate
+
+    this.refreshInterval = setTimeout(async () => {
+      try {
+        await this.refreshMusicData()
+      } finally {
+        // Reschedule from here rather than on a fixed interval, so a slow poll
+        // cannot stack requests on top of itself.
+        this.scheduleRefresh()
+      }
+    }, delay)
   }
 
   async setAudioSource(source: string): Promise<void> {
@@ -217,6 +273,14 @@ export class MusicService implements MusicStoreClass {
       if (cachedSong) {
         await this.sendMusicToClient(client.clientId)
       }
+      // Someone can see the screen now — start looking often enough to keep it
+      // honest about changes made elsewhere.
+      this.scheduleRefresh()
+    })
+
+    // ...and stop paying for that the moment nobody is watching.
+    this.platformStore.on(PlatformStoreEvent.CLIENT_DISCONNECTED, () => {
+      this.scheduleRefresh()
     })
 
     // Listen for app messages
@@ -252,6 +316,11 @@ export class MusicService implements MusicStoreClass {
     // Listen for song end events
     this.songCache.on(SongCacheEvents.SONG_ENDED, () => {
       this.chaseTrackChange()
+    })
+
+    // Pausing or resuming changes whether a fast poll is worth paying for.
+    this.songCache.on(SongCacheEvents.SONG_CHANGED, () => {
+      this.scheduleRefresh()
     })
 
     // NOTE: SONG_CHANGED deliberately does not broadcast. handleMusicPayload
