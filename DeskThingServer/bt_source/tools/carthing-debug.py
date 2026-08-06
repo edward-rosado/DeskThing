@@ -218,6 +218,28 @@ class CDP:
                 return msg.get('result', {})
         sys.exit('timed out waiting for the device to answer')
 
+    def drain_events(self, method, seconds=2.0):
+        """Collect events of one method for a short window.
+
+        Runtime.enable replays a creation event for every context that already
+        exists, but there is no reply to wait on — so read for a fixed spell
+        and return what arrived.
+        """
+        events = []
+        deadline = time.time() + seconds
+        self.sock.settimeout(0.4)
+        try:
+            while time.time() < deadline:
+                try:
+                    msg = self.recv()
+                except socket.timeout:
+                    continue
+                if msg and msg.get('method') == method:
+                    events.append(msg)
+        finally:
+            self.sock.settimeout(self.timeout)
+        return events
+
     def close(self):
         if self.sock:
             try:
@@ -274,14 +296,95 @@ def cmd_shot(args, port, transport):
         cdp.close()
 
 
+def frame_context(cdp, needle):
+    """Execution-context id for the frame whose URL/origin contains `needle`.
+
+    Every DeskThing app renders inside an iframe (http://localhost:8891/app/...)
+    that is cross-origin to the file:// page hosting it, so the parent document
+    cannot reach into it and a plain Runtime.evaluate never sees the app's DOM.
+
+    Contexts come from Runtime.executionContextCreated rather than
+    Page.getFrameTree: on this device's Chromium 69 the app iframe does not
+    appear in the frame tree at all, but it does announce a context.
+    """
+    contexts = []
+    cdp.send('Runtime.enable')
+    # Runtime.enable replays a creation event for every context that already
+    # exists, so a short drain collects them all.
+    for event in cdp.drain_events('Runtime.executionContextCreated', seconds=2.0):
+        ctx = event.get('params', {}).get('context', {})
+        contexts.append((ctx.get('id'), ctx.get('origin', ''), ctx.get('name', '')))
+
+    for ctx_id, origin, name in contexts:
+        if needle in (origin or '') or needle in (name or ''):
+            return ctx_id, origin or name
+
+    known = '\n'.join('    id=%s origin=%s name=%s' % c for c in contexts) or '    (none)'
+    sys.exit('No frame matching %r. Contexts present:\n%s' % (needle, known))
+
+
+def cmd_frames(args, port, transport):
+    """List execution contexts, so --frame has something to aim at."""
+    cdp, _ = open_page(port)
+    try:
+        cdp.send('Runtime.enable')
+        for event in cdp.drain_events('Runtime.executionContextCreated', seconds=2.0):
+            ctx = event.get('params', {}).get('context', {})
+            print('id=%-4s origin=%-40s %s' % (
+                ctx.get('id'), ctx.get('origin') or '(none)', ctx.get('name') or ''))
+    finally:
+        cdp.close()
+
+
+def cmd_tap(args, port, transport):
+    """Tap the screen at a point, the way a finger would.
+
+    Input events are dispatched by the browser rather than into a document, so
+    unlike eval this reaches content inside a cross-origin iframe — which is
+    where every DeskThing app lives. It is the only way to drive an app's UI
+    from here.
+
+    Sends touch only. Sending a touch pair AND a mouse click looks like one
+    gesture but is not: the browser already synthesises a click from the touch,
+    so the extra mouse event delivers a SECOND click. On a toggle that reads as
+    two presses and lands back where it started — the control appears dead while
+    actually firing twice. Use --mouse for anything that genuinely only listens
+    for mouse events.
+    """
+    cdp, _ = open_page(port)
+    try:
+        if args.mouse:
+            for kind in ('mousePressed', 'mouseReleased'):
+                cdp.await_result(cdp.send('Input.dispatchMouseEvent', {
+                    'type': kind, 'x': args.x, 'y': args.y,
+                    'button': 'left', 'clickCount': 1,
+                }))
+        else:
+            point = [{'x': args.x, 'y': args.y, 'radiusX': 6, 'radiusY': 6, 'force': 1}]
+            cdp.await_result(cdp.send('Input.dispatchTouchEvent', {
+                'type': 'touchStart', 'touchPoints': point,
+            }))
+            cdp.await_result(cdp.send('Input.dispatchTouchEvent', {
+                'type': 'touchEnd', 'touchPoints': [],
+            }))
+        print('tapped %d,%d%s' % (args.x, args.y, ' (mouse)' if args.mouse else ''))
+    finally:
+        cdp.close()
+
+
 def cmd_eval(args, port, transport):
     cdp, _ = open_page(port)
     try:
-        msg_id = cdp.send('Runtime.evaluate', {
+        params = {
             'expression': args.expression,
             'returnByValue': True,
             'awaitPromise': True,
-        })
+        }
+        if getattr(args, 'frame', None):
+            context_id, url = frame_context(cdp, args.frame)
+            params['contextId'] = context_id
+            print('(evaluating in frame %s)' % url, file=sys.stderr)
+        msg_id = cdp.send('Runtime.evaluate', params)
         result = cdp.await_result(msg_id)
         # A thrown exception comes back as a *successful* CDP response carrying
         # exceptionDetails. Reporting only the (undefined) value would print
@@ -419,6 +522,18 @@ def main():
 
     p = sub.add_parser('eval', help='run JavaScript in the page')
     p.add_argument('expression')
+    p.add_argument('--frame', metavar='URL_SUBSTRING',
+                   help='evaluate inside a child frame instead of the top page. '
+                        'DeskThing apps render in a cross-origin iframe, so their '
+                        'DOM is unreachable without this (try --frame app/spotify)')
+
+    sub.add_parser('frames', help='list the frames on the page')
+
+    p = sub.add_parser('tap', help='tap the screen (reaches into app iframes)')
+    p.add_argument('x', type=int)
+    p.add_argument('y', type=int)
+    p.add_argument('--mouse', action='store_true',
+                   help='send a mouse click instead of a touch')
 
     p = sub.add_parser('navigate', help='point the page at a URL')
     p.add_argument('url')
@@ -440,7 +555,7 @@ def main():
     handler = {
         'info': cmd_info, 'shot': cmd_shot, 'eval': cmd_eval,
         'navigate': cmd_navigate, 'reload': cmd_reload, 'console': cmd_console,
-        'timeline': cmd_timeline,
+        'timeline': cmd_timeline, 'frames': cmd_frames, 'tap': cmd_tap,
     }[args.command]
     handler(args, port, transport)
 
