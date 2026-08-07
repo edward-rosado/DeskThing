@@ -9,6 +9,7 @@ if that is what is attached) and exposes the useful parts.
     ./carthing-debug.py info                  what is running, what page is loaded
     ./carthing-debug.py shot screen.png       screenshot the display
     ./carthing-debug.py eval "location.href"  run JS in the page
+    ./carthing-debug.py swipe 630 300 630 120 scroll a list by dragging
     ./carthing-debug.py console               stream console output until Ctrl-C
     ./carthing-debug.py navigate <url>        point the page somewhere
     ./carthing-debug.py reload                reload the page
@@ -372,6 +373,47 @@ def cmd_tap(args, port, transport):
         cdp.close()
 
 
+def cmd_swipe(args, port, transport):
+    """Drag a finger across the screen — the only way to scroll a list here.
+
+    A scroll wheel event is not enough: the panels are touch-scrolled containers
+    inside a cross-origin iframe, and much of the UI also treats a tap as a
+    gesture. This sends a real touchStart / touchMove* / touchEnd sequence so the
+    page sees the same thing a finger produces.
+
+    The intermediate moves matter. A single jump from start to end reads as a
+    fling with no velocity history and most scroll containers ignore it; the
+    steps give it a believable path.
+    """
+    cdp, _ = open_page(port)
+    try:
+        steps = max(2, args.steps)
+        pause = args.duration / float(steps)
+
+        def point(x, y):
+            return [{'x': int(x), 'y': int(y), 'radiusX': 6, 'radiusY': 6, 'force': 1}]
+
+        cdp.await_result(cdp.send('Input.dispatchTouchEvent', {
+            'type': 'touchStart', 'touchPoints': point(args.x1, args.y1),
+        }))
+        for i in range(1, steps + 1):
+            frac = i / float(steps)
+            cdp.await_result(cdp.send('Input.dispatchTouchEvent', {
+                'type': 'touchMove',
+                'touchPoints': point(
+                    args.x1 + (args.x2 - args.x1) * frac,
+                    args.y1 + (args.y2 - args.y1) * frac,
+                ),
+            }))
+            time.sleep(pause)
+        cdp.await_result(cdp.send('Input.dispatchTouchEvent', {
+            'type': 'touchEnd', 'touchPoints': [],
+        }))
+        print('swiped %d,%d -> %d,%d' % (args.x1, args.y1, args.x2, args.y2))
+    finally:
+        cdp.close()
+
+
 def cmd_eval(args, port, transport):
     cdp, _ = open_page(port)
     try:
@@ -535,6 +577,16 @@ def main():
     p.add_argument('--mouse', action='store_true',
                    help='send a mouse click instead of a touch')
 
+    p = sub.add_parser('swipe', help='drag across the screen (scrolls lists)')
+    p.add_argument('x1', type=int)
+    p.add_argument('y1', type=int)
+    p.add_argument('x2', type=int)
+    p.add_argument('y2', type=int)
+    p.add_argument('--steps', type=int, default=12,
+                   help='intermediate touchMove events (default 12)')
+    p.add_argument('--duration', type=float, default=0.35,
+                   help='seconds the gesture takes (default 0.35)')
+
     p = sub.add_parser('navigate', help='point the page at a URL')
     p.add_argument('url')
 
@@ -556,6 +608,7 @@ def main():
         'info': cmd_info, 'shot': cmd_shot, 'eval': cmd_eval,
         'navigate': cmd_navigate, 'reload': cmd_reload, 'console': cmd_console,
         'timeline': cmd_timeline, 'frames': cmd_frames, 'tap': cmd_tap,
+        'swipe': cmd_swipe,
     }[args.command]
     handler(args, port, transport)
 
