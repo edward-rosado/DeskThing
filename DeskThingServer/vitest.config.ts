@@ -18,7 +18,12 @@ export default defineConfig({
       // Mapping it onto 'electron' makes the module id identical to the one the
       // suites already `vi.mock('electron', ...)`, so the existing mocks apply
       // and no production import has to change to suit the test runner.
-      'electron/main': 'electron',
+      // Both ids land on one stub. The real module throws on import when
+      // electron's binary is absent (CI uses --ignore-scripts), and
+      // `electron/main` does not resolve under plain node at all.
+      // vi.mock('electron', ...) in a suite still overrides this.
+      'electron/main': resolve('test/mocks/electron.ts'),
+      electron: resolve('test/mocks/electron.ts'),
       '@renderer': resolve('src/renderer/src'),
       '@server': resolve('src/main'),
       '@shared': resolve('src/shared'),
