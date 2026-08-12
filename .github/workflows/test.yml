@@ -1,0 +1,47 @@
+name: test
+
+# Additive: build.yml owns packaging/release and is deliberately untouched.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DeskThingServer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+          cache: npm
+          cache-dependency-path: DeskThingServer/package-lock.json
+
+      # --ignore-scripts: electron's postinstall downloads a ~100MB binary that
+      # no source test needs. The vitest suites mock 'electron' entirely.
+      - run: npm ci --ignore-scripts
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: vitest
+        run: npm run test:ci
+
+  bluetooth-protocol:
+    # The frame protocol has golden vectors; they are pure python and cost
+    # seconds, so they gate every push rather than waiting for hardware.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DeskThingServer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: bt protocol tests
+        run: npm run test:py
