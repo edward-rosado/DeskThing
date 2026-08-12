@@ -21,7 +21,9 @@
     "postinstall": "electron-builder install-app-deps && electron-rebuild && npm rebuild sharp",
     "build:unpack": "npm run build && electron-builder --dir",
     "test": "vitest",
-    "test:bt": "vitest run test/main/services/bluetooth && python3 -m unittest discover -s bt_source/test -v"
+    "test:bt": "vitest run test/main/services/bluetooth && python3 -m unittest discover -s bt_source/test -v",
+    "test:ci": "vitest run",
+    "test:py": "python3 -m unittest discover -s bt_source/test"
   },
   "repository": {
     "type": "git",
